@@ -170,9 +170,9 @@ for epoch in range(start_epoch, total_epoch):
         
 
         train_data_ = torch.cat([train_data, train_data1], dim=0)
-        train_pred, logsigma, feat = model(train_data_)
-        feat_aug = feat[0][batch_size:]
-        feat = feat[0][:batch_size]
+        train_pred, logsigma = model(train_data_)
+        #feat_aug = feat[0][batch_size:]
+        #feat = feat[0][:batch_size]
         train_pred_aug = [train_pred[0][batch_size:], train_pred[1][batch_size:], train_pred[2][batch_size:]]
         train_pred = [train_pred[0][:batch_size], train_pred[1][:batch_size], train_pred[2][:batch_size]]
         loss = 0
@@ -194,9 +194,7 @@ for epoch in range(start_epoch, total_epoch):
                     train_loss_ind[i] = 0
             train_pred_ind = [train_pred_seg, train_pred_depth, train_pred_normal]
 
-            # compute the cross-task consistency loss
-            con_loss = mapfns(train_pred_ind, train_target_ind, feat_aug[ind_].unsqueeze(0), copy.deepcopy(w), ssl_type=opt.ssl_type)
-
+            con_loss = 0    
             if opt.rampup == 'up':
                 if epoch > 99:
                     con_weight = 1
@@ -206,8 +204,9 @@ for epoch in range(start_epoch, total_epoch):
                 con_weight = 1
             con_weight *= opt.con_weight
 
-            con_loss_ave.update(con_loss.item(), 1)
-            loss = loss + sum(train_loss_ind[i] for i in range(len(tasks))) / len(image_index) + con_loss * con_weight / len(image_index)
+            con_loss_ave.update(con_loss, 1)
+
+            loss = loss + sum(train_loss_ind[i] for i in range(len(tasks))) / len(image_index) / len(image_index)
         train_loss = model.model_fit(train_pred[0], train_label, train_pred[1], train_depth, train_pred[2], train_normal)
 
         optimizer.zero_grad()
@@ -246,7 +245,6 @@ for epoch in range(start_epoch, total_epoch):
         bar.next()
     bar.finish()
 
-    
 
     if opt.eval_last20 == 0:
         evaluate = True
