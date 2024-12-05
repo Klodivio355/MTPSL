@@ -162,7 +162,7 @@ for epoch in range(start_epoch, total_epoch):
     cost_normal = AverageMeter()
     nyuv2_train_dataset = iter(nyuv2_train_loader)
     for k in range(train_batch):
-        train_data, train_label, train_depth, train_normal, image_index, train_data1, train_label1, train_depth1, train_normal1, trans_params = nyuv2_train_dataset.next()
+        train_data, train_label, train_depth, train_normal, image_index, train_data1, train_label1, train_depth1, train_normal1, trans_params = next(iter(nyuv2_train_dataset))
         train_data, train_label = train_data.cuda(), train_label.type(torch.LongTensor).cuda()
         train_depth, train_normal = train_depth.cuda(), train_normal.cuda()
         train_data1, train_label1 = train_data1.cuda(), train_label1.type(torch.LongTensor).cuda()
@@ -264,7 +264,7 @@ for epoch in range(start_epoch, total_epoch):
         with torch.no_grad():  # operations inside don't track history
             nyuv2_test_dataset = iter(nyuv2_test_loader)
             for k in range(test_batch):
-                test_data, test_label, test_depth, test_normal = nyuv2_test_dataset.next()
+                test_data, test_label, test_depth, test_normal = next(iter(nyuv2_test_dataset))
                 test_data, test_label = test_data.cuda(),  test_label.type(torch.LongTensor).cuda()
                 test_depth, test_normal = test_depth.cuda(), test_normal.cuda()
 
