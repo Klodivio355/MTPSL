@@ -6,6 +6,7 @@ from torch.autograd import Variable
 import torch.nn.init as init
 import numpy as np
 import pdb
+from transformers import AutoImageProcessor, Swinv2Model
 
 # Define SegNet
 # The implementation of SegNet is from https://github.com/lorenmt/mtan
@@ -21,6 +22,8 @@ class SegNet(nn.Module):
             filter = [64, 128, 256, 512, 512]
 
         self.class_nb = class_nb
+
+        self.backbone = Swinv2Model.from_pretrained("microsoft/swinv2-tiny-patch4-window8-256", cache_dir='hf_cache')
 
         # define encoder decoder layers
         self.encoder_block = nn.ModuleList([self.conv_layer([3, filter[0]])])
