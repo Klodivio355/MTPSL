@@ -134,14 +134,15 @@ class Mapfns(nn.Module):
                 nn.init.xavier_normal_(m.weight)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x_pred, gt, feat, w, ssl_type, reg_weight=0.5):
+    def forward(self, x_pred, gt, feat, we, ssl_type, reg_weight=0.5):
         if ssl_type == 'full':
             target_task_index = torch.arange(len(self.tasks)) 
             source_task_index = torch.arange(len(self.tasks))
         else:
-            target_task_index = (w.data == 1).nonzero(as_tuple=False).view(-1)
-            source_task_index = (w.data == 0).nonzero(as_tuple=False).view(-1)
-
+            target_task_index = (we.data == 1).nonzero(as_tuple=False).view(-1)
+            source_task_index = (we.data == 0).nonzero(as_tuple=False).view(-1)
+        breakpoint()
+        
         # loss = torch.tensor(0).to(feat.device)
         loss = 0
         if len(source_task_index) > 0:
@@ -203,6 +204,7 @@ class Mapfns(nn.Module):
         # cross-task consistency
         l_s_t = 1 - F.cosine_similarity(mapout_source, mapout_target, dim=1, eps=1e-12).mean()
         # regularization
+        #breakpoint()
         l_s_f = 1 - F.cosine_similarity(mapout_source, feat.detach(), dim=1, eps=1e-12).mean()
         l_t_f = 1 - F.cosine_similarity(mapout_target, feat.detach(), dim=1, eps=1e-12).mean()
 

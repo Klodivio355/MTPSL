@@ -1,1 +1,0 @@
-Epoch	T.Ls	T. mIoU	T. Pix	T.Ld	T.abs	T.rel	T.Ln	T.Mean	T.Med	T.11	T.22	T.30	V.Ls	V. mIoU	V. Pix	V.Ld	V.abs	V.rel	V.Ln	V.Mean	V.Med	V.11	V.22	V.30	Con L	Ws	Wd	Wn	

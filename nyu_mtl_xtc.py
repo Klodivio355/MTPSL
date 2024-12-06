@@ -168,19 +168,18 @@ for epoch in range(start_epoch, total_epoch):
         train_data1, train_label1 = train_data1.cuda(), train_label1.type(torch.LongTensor).cuda()
         train_depth1, train_normal1 = train_depth1.cuda(), train_normal1.cuda()
         
-
         train_data_ = torch.cat([train_data, train_data1], dim=0)
-        train_pred, logsigma = model(train_data_)
-        #feat_aug = feat[0][batch_size:]
-        #feat = feat[0][:batch_size]
+        train_pred, logsigma, feat, latent_representation = model(train_data_)
+        feat_aug = feat[0][batch_size:]
+        feat = feat[0][:batch_size]
         train_pred_aug = [train_pred[0][batch_size:], train_pred[1][batch_size:], train_pred[2][batch_size:]]
         train_pred = [train_pred[0][:batch_size], train_pred[1][:batch_size], train_pred[2][:batch_size]]
         loss = 0
         for ind_ in range(len(image_index)):
             if opt.ssl_type == 'full':
-                w = torch.ones(len(tasks)).float().cuda()
+                weighting = torch.ones(len(tasks)).float().cuda()
             else:
-                w = labels_weights[image_index[ind_]].clone().float().cuda()
+                we = labels_weights[image_index[ind_]].clone().float().cuda()
             train_pred_seg = train_pred_aug[0][ind_][None,:,:,:]
             train_pred_depth = train_pred_aug[1][ind_][None,:,:,:]
             train_pred_normal = train_pred_aug[2][ind_][None,:,:,:]
@@ -190,11 +189,28 @@ for epoch in range(start_epoch, total_epoch):
             train_target_ind = [train_label1[ind_].unsqueeze(0), train_depth1[ind_].unsqueeze(0), train_normal1[ind_].unsqueeze(0)]
             train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_label[ind_].unsqueeze(0), train_pred[1][ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_pred[2][ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0))
             for i in range(len(tasks)):
-                if w[i] == 0:
+                if we[i] == 0:
                     train_loss_ind[i] = 0
             train_pred_ind = [train_pred_seg, train_pred_depth, train_pred_normal]
 
-            con_loss = 0    
+            gts = torch.cat([train_target_ind[0].unsqueeze(1), train_target_ind[1], train_target_ind[2]], dim=1)
+            mask = torch.zeros(5)
+            if we[0] == 1:
+                mask[0] = 1
+            if we[1] == 1:
+                mask[1] = 1
+            if we[2] == 1:
+                mask[2:5] = 1
+
+            breakpoint()
+            for i, tag in enumerate(we):
+                if tag == 0: # if task is unsupervised
+                    refined_prediction = model.teacher_forward(latent_representation, i, gts, mask)
+                    train_pred[i] = refined_prediction
+            #con_loss = mapfns(train_pred_ind, train_target_ind, feat_aug[ind_].unsqueeze(0), copy.deepcopy(we), ssl_type=opt.ssl_type)
+            con_loss = torch.zeros(0)
+            breakpoint()
+
             if opt.rampup == 'up':
                 if epoch > 99:
                     con_weight = 1
@@ -206,7 +222,7 @@ for epoch in range(start_epoch, total_epoch):
 
             con_loss_ave.update(con_loss, 1)
 
-            loss = loss + sum(train_loss_ind[i] for i in range(len(tasks))) / len(image_index) / len(image_index)
+            loss = loss + sum(train_loss_ind[i] for i in range(len(tasks))) / len(image_index) + (con_loss * con_weight) / len(image_index)
         train_loss = model.model_fit(train_pred[0], train_label, train_pred[1], train_depth, train_pred[2], train_normal)
 
         optimizer.zero_grad()
@@ -236,9 +252,9 @@ for epoch in range(start_epoch, total_epoch):
                     loss_s=cost_seg.avg,
                     loss_d=cost_depth.avg,
                     loss_n=cost_normal.avg,
-                    ws=w[0].data,
-                    wd=w[1].data,
-                    wn=w[2].data,
+                    ws=we[0].data,
+                    wd=we[1].data,
+                    wn=we[2].data,
                     ctl=con_loss_ave.avg,
                     cw=con_weight,
                     )

@@ -26,13 +26,19 @@ class SegNet(nn.Module):
         self.backbone = Swinv2Model.from_pretrained("microsoft/swinv2-tiny-patch4-window8-256", cache_dir='hf_cache')
 
         # define task specific layers
-        self.pred_task1 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+        self.teacher_task1 = DecoderWithCrossAttention(512, 5, self.class_nb)
+        self.student_task1 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
                                         nn.Conv2d(in_channels=filter[0], out_channels=self.class_nb, kernel_size=1, padding=0))
-        self.pred_task2 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+
+        self.teacher_task2 = DecoderWithCrossAttention(512, 5, 1)
+        self.student_task2 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
                                         nn.Conv2d(in_channels=filter[0], out_channels=1, kernel_size=1, padding=0))
-        self.pred_task3 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+
+        self.teacher_task3 = DecoderWithCrossAttention(512, 5, 3)
+        self.student_task3 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
                                         nn.Conv2d(in_channels=filter[0], out_channels=3, kernel_size=1, padding=0))
 
+        self.teachers = nn.ModuleList([self.teacher_task1, self.teacher_task2, self.teacher_task3])
         self.channel_reduction = nn.Conv2d(2208, 512, kernel_size=1, stride=1, bias=False)
 
         # define pooling and unpooling functions
@@ -55,17 +61,21 @@ class SegNet(nn.Module):
             F.interpolate(f, size=(288, 384), mode='bilinear', align_corners=False)
             for f in feature_maps
         ]
+
+        feat = feature_maps[-1]
         latent_representation = self.channel_reduction(torch.cat(interpolated_features, dim=1))  
 
-        #breakpoint()
-
         # define task prediction layers
-        t1_pred = F.log_softmax(self.pred_task1(latent_representation), dim=1)
-        t2_pred = self.pred_task2(latent_representation)
-        t3_pred = self.pred_task3(latent_representation)
+        t1_pred = F.log_softmax(self.student_task1(latent_representation), dim=1)
+        t2_pred = self.student_task2(latent_representation)
+        t3_pred = self.student_task3(latent_representation)
         t3_pred = t3_pred / torch.norm(t3_pred, p=2, dim=1, keepdim=True)
 
-        return [t1_pred, t2_pred, t3_pred], self.logsigma
+        return [t1_pred, t2_pred, t3_pred], self.logsigma, feat, latent_representation
+
+    def teacher_forward(self, x, index, gts, mask):
+        prediction = self.teachers[index](x, gts, mask)
+        return prediction
 
     def model_fit(self, x_pred1, x_output1, x_pred2, x_output2, x_pred3, x_output3):
         # Compute supervised task-specific loss for all tasks when all task labels are available
@@ -197,3 +207,38 @@ class SegNet(nn.Module):
         error = torch.acos(torch.clamp(torch.sum(x_pred * x_output, 1).masked_select(binary_mask), -1, 1)).detach().cpu().numpy()
         error = np.degrees(error)
         return np.mean(error), np.median(error), np.mean(error < 11.25), np.mean(error < 22.5), np.mean(error < 30)
+
+class DecoderWithCrossAttention(nn.Module):
+    def __init__(self, in_channels, aux_dim, output_channels, num_heads=4):
+        super().__init__()
+        # Transposed Convolution for Upsampling
+        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=3, padding=1)
+        self.upsample = nn.ConvTranspose2d(in_channels, output_channels, kernel_size=2, stride=2)
+        
+        # Cross Attention
+        self.cross_attention = nn.MultiheadAttention(embed_dim=in_channels, num_heads=num_heads, batch_first=True)
+        
+        # Optional LayerNorm for stability
+        self.norm = nn.LayerNorm(in_channels)
+
+    def forward(self, x, aux_input=None, mask=None):
+        # Initial Conv Layer
+        x = self.conv1(x)
+        
+        # Cross-Attention: Skip if no aux_input
+        if aux_input is not None:
+            B, C, H, W = x.shape
+            # Flatten spatial dimensions for MultiheadAttention
+            x_flat = x.view(B, C, -1).permute(0, 2, 1)  # (batch_size, seq_len, in_channels)
+            aux_flat = aux_input.view(B, C, -1).permute(0, 2, 1)  # (batch_size, seq_len, aux_dim)
+            
+            # Cross-Attention
+            attended_x, _ = self.cross_attention(query=x_flat, key=aux_flat, value=aux_flat, key_padding_mask=mask)
+            x = attended_x.permute(0, 2, 1).view(B, C, H, W)  # Reshape back to spatial dims
+            
+            # Optional normalization
+            x = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+        # Transposed Convolution for Upsampling
+        x = self.upsample(x)
+        return x
