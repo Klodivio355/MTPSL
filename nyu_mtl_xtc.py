@@ -194,22 +194,24 @@ for epoch in range(start_epoch, total_epoch):
             train_pred_ind = [train_pred_seg, train_pred_depth, train_pred_normal]
 
             gts = torch.cat([train_target_ind[0].unsqueeze(1), train_target_ind[1], train_target_ind[2]], dim=1)
-            mask = torch.zeros(5)
+            #breakpoint()
             if we[0] == 1:
-                mask[0] = 1
+                gts[ind_][0] = 0
             if we[1] == 1:
-                mask[1] = 1
+                gts[ind_][1] = 0
             if we[2] == 1:
-                mask[2:5] = 1
-
-            breakpoint()
-            for i, tag in enumerate(we):
+                gts[ind_][2:5] = 0
+            #breakpoint()
+            #breakpoint()
+            for i, tag in enumerate(copy.deepcopy(we)):
                 if tag == 0: # if task is unsupervised
-                    refined_prediction = model.teacher_forward(latent_representation, i, gts, mask)
-                    train_pred[i] = refined_prediction
+                    #breakpoint()
+                    refined_prediction = model.teacher_forward(latent_representation[i].unsqueeze(0), i, gts)
+                    train_pred[int(tag.item())][i] = refined_prediction
+                    #breakpoint()
             #con_loss = mapfns(train_pred_ind, train_target_ind, feat_aug[ind_].unsqueeze(0), copy.deepcopy(we), ssl_type=opt.ssl_type)
-            con_loss = torch.zeros(0)
-            breakpoint()
+            con_loss = torch.zeros(0).cuda()
+            #breakpoint()
 
             if opt.rampup == 'up':
                 if epoch > 99:
@@ -221,7 +223,7 @@ for epoch in range(start_epoch, total_epoch):
             con_weight *= opt.con_weight
 
             con_loss_ave.update(con_loss, 1)
-
+            #breakpoint()
             loss = loss + sum(train_loss_ind[i] for i in range(len(tasks))) / len(image_index) + (con_loss * con_weight) / len(image_index)
         train_loss = model.model_fit(train_pred[0], train_label, train_pred[1], train_depth, train_pred[2], train_normal)
 

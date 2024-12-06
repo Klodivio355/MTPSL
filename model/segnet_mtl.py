@@ -73,8 +73,8 @@ class SegNet(nn.Module):
 
         return [t1_pred, t2_pred, t3_pred], self.logsigma, feat, latent_representation
 
-    def teacher_forward(self, x, index, gts, mask):
-        prediction = self.teachers[index](x, gts, mask)
+    def teacher_forward(self, x, index, gts):
+        prediction = self.teachers[index](x, gts)
         return prediction
 
     def model_fit(self, x_pred1, x_output1, x_pred2, x_output2, x_pred3, x_output3):
@@ -217,23 +217,32 @@ class DecoderWithCrossAttention(nn.Module):
         
         # Cross Attention
         self.cross_attention = nn.MultiheadAttention(embed_dim=in_channels, num_heads=num_heads, batch_first=True)
-        
+        #self.cross_attention = CrossAttentionLayer
         # Optional LayerNorm for stability
+        self.linear = nn.Linear(5, 512)
         self.norm = nn.LayerNorm(in_channels)
+        self.pool1 = nn.MaxPool2d(kernel_size=3, stride=2)
+        self.pool2 = nn.MaxPool2d(kernel_size=3, stride=2)
+        #self.patch_size = 16  # Size of each patch
 
-    def forward(self, x, aux_input=None, mask=None):
+
+    def forward(self, x, aux_input):
         # Initial Conv Layer
         x = self.conv1(x)
-        
         # Cross-Attention: Skip if no aux_input
         if aux_input is not None:
+            x = self.pool1(x)
+            aux_input = self.pool2(aux_input)
+            #breakpoint()
             B, C, H, W = x.shape
+            B_, C_, H_, W_ = aux_input.shape
             # Flatten spatial dimensions for MultiheadAttention
             x_flat = x.view(B, C, -1).permute(0, 2, 1)  # (batch_size, seq_len, in_channels)
-            aux_flat = aux_input.view(B, C, -1).permute(0, 2, 1)  # (batch_size, seq_len, aux_dim)
-            
+            aux_flat = aux_input.view(B_, C_, -1).permute(0, 2, 1)  # (batch_size, seq_len, aux_dim)
+            aux_flat = self.linear(aux_flat)
+            #breakpoint()
             # Cross-Attention
-            attended_x, _ = self.cross_attention(query=x_flat, key=aux_flat, value=aux_flat, key_padding_mask=mask)
+            attended_x, _ = self.cross_attention(query=x_flat, key=aux_flat, value=aux_flat)
             x = attended_x.permute(0, 2, 1).view(B, C, H, W)  # Reshape back to spatial dims
             
             # Optional normalization
@@ -242,3 +251,29 @@ class DecoderWithCrossAttention(nn.Module):
         # Transposed Convolution for Upsampling
         x = self.upsample(x)
         return x
+
+class CrossAttentionLayer(nn.Module):
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1):
+        super(CrossAttentionLayer, self).__init__()
+        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, ff_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+    def forward(self, query, key, value):
+        # Multi-head cross-attention
+        attn_output, _ = self.multihead_attn(query, key, value)
+        attn_output = self.norm1(attn_output + query)
+
+        # Feed-forward network
+        ffn_output = self.ffn(attn_output)
+        output = self.norm2(ffn_output + attn_output)
+
+        return output
+
