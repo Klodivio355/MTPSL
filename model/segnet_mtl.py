@@ -26,7 +26,7 @@ class SegNet(nn.Module):
         self.backbone = Swinv2Model.from_pretrained("microsoft/swinv2-tiny-patch4-window8-256", cache_dir='hf_cache')
 
         # define task specific layers
-        self.teacher_task1 = DecoderWithCrossAttention(512, 5, self.class_nb)
+        self.teacher_task1 = DecoderWithCrossAttention(512, 5, 1)
         self.student_task1 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
                                         nn.Conv2d(in_channels=filter[0], out_channels=self.class_nb, kernel_size=1, padding=0))
 
@@ -213,7 +213,7 @@ class DecoderWithCrossAttention(nn.Module):
         super().__init__()
         # Transposed Convolution for Upsampling
         self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=3, padding=1)
-        self.upsample = nn.ConvTranspose2d(in_channels, output_channels, kernel_size=2, stride=2)
+        self.upsample = nn.ConvTranspose2d(in_channels, output_channels, kernel_size=(4, 4), stride=(4, 4), padding=(1,1), output_padding=(0,0))
         
         # Cross Attention
         self.cross_attention = nn.MultiheadAttention(embed_dim=in_channels, num_heads=num_heads, batch_first=True)
@@ -221,16 +221,18 @@ class DecoderWithCrossAttention(nn.Module):
         # Optional LayerNorm for stability
         self.linear = nn.Linear(5, 512)
         self.norm = nn.LayerNorm(in_channels)
-        self.pool1 = nn.MaxPool2d(kernel_size=3, stride=2)
-        self.pool2 = nn.MaxPool2d(kernel_size=3, stride=2)
-        #self.patch_size = 16  # Size of each patch
+        self.pool1 = nn.MaxPool2d(kernel_size=4, stride=2)
+        self.pool2 = nn.MaxPool2d(kernel_size=4, stride=2)
 
-
+        self.pool1D = nn.AvgPool1d(kernel_size=4, stride=4)
+        self.pool1D2 = nn.AvgPool1d(kernel_size=4, stride=4)
+        
     def forward(self, x, aux_input):
         # Initial Conv Layer
         x = self.conv1(x)
         # Cross-Attention: Skip if no aux_input
         if aux_input is not None:
+            #breakpoint()
             x = self.pool1(x)
             aux_input = self.pool2(aux_input)
             #breakpoint()
@@ -240,16 +242,23 @@ class DecoderWithCrossAttention(nn.Module):
             x_flat = x.view(B, C, -1).permute(0, 2, 1)  # (batch_size, seq_len, in_channels)
             aux_flat = aux_input.view(B_, C_, -1).permute(0, 2, 1)  # (batch_size, seq_len, aux_dim)
             aux_flat = self.linear(aux_flat)
-            #breakpoint()
+
+            A, D = 165, 165
+            x_pool = x_flat.transpose(1, 2)  # [Batch, Embedding Size, Sequence Length]
+            x_pooled = self.pool1D(x_pool).transpose(1, 2)  # [1, 6828, 512]
+            aux_pool = aux_flat.transpose(1, 2)  # [Batch, Embedding Size, Sequence Length]
+            aux_pooled = self.pool1D2(aux_pool).transpose(1, 2)  # [1, 6828, 512]
             # Cross-Attention
-            attended_x, _ = self.cross_attention(query=x_flat, key=aux_flat, value=aux_flat)
-            x = attended_x.permute(0, 2, 1).view(B, C, H, W)  # Reshape back to spatial dims
-            
+            attended_x, _ = self.cross_attention(query=x_pooled, key=aux_pooled, value=aux_pooled)
+            target_seq_len = 6889
+            padding_len = target_seq_len - attended_x.size(1)  # 6889 - 6828 = 61
+            attended_x = torch.nn.functional.pad(attended_x, (0, 0, 0, padding_len))
+            x = attended_x.permute(0, 2, 1).view(B, C, 83, 83)  # Reshape back to spatial dims
             # Optional normalization
             x = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-
         # Transposed Convolution for Upsampling
         x = self.upsample(x)
+        x = F.interpolate(x, size=(288, 384), mode='bilinear', align_corners=False)
         return x
 
 class CrossAttentionLayer(nn.Module):

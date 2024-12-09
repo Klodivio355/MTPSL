@@ -68,6 +68,7 @@ logger = Logger(os.path.join(opt.out, 'mtl_xtc_{}_{}_{}_{}_log.txt'.format(opt.s
 logger.set_names(['Epoch', 'T.Ls', 'T. mIoU', 'T. Pix', 'T.Ld', 'T.abs', 'T.rel', 'T.Ln', 'T.Mean', 'T.Med', 'T.11', 'T.22', 'T.30',
     'V.Ls', 'V. mIoU', 'V. Pix', 'V.Ld', 'V.abs', 'V.rel', 'V.Ln', 'V.Mean', 'V.Med', 'V.11', 'V.22', 'V.30', 'Con L', 'Ws', 'Wd', 'Wn'])
 
+
 # define model, optimiser and scheduler
 model = SegNet(type_=opt.type, class_nb=13).cuda()
 mapfns = Mapfns(tasks=tasks, input_channels=input_channels).cuda()
@@ -194,24 +195,22 @@ for epoch in range(start_epoch, total_epoch):
             train_pred_ind = [train_pred_seg, train_pred_depth, train_pred_normal]
 
             gts = torch.cat([train_target_ind[0].unsqueeze(1), train_target_ind[1], train_target_ind[2]], dim=1)
-            #breakpoint()
+
             if we[0] == 1:
-                gts[ind_][0] = 0
+                gts[0][0] = 0
             if we[1] == 1:
-                gts[ind_][1] = 0
+                gts[0][1] = 0
             if we[2] == 1:
-                gts[ind_][2:5] = 0
-            #breakpoint()
-            #breakpoint()
+                gts[0][2:5] = 0
+            
             for i, tag in enumerate(copy.deepcopy(we)):
                 if tag == 0: # if task is unsupervised
-                    #breakpoint()
                     refined_prediction = model.teacher_forward(latent_representation[i].unsqueeze(0), i, gts)
-                    train_pred[int(tag.item())][i] = refined_prediction
-                    #breakpoint()
+                    #train_pred[i][ind_] = refined_prediction
+                    train_target_ind[i] = refined_prediction
+                    
             #con_loss = mapfns(train_pred_ind, train_target_ind, feat_aug[ind_].unsqueeze(0), copy.deepcopy(we), ssl_type=opt.ssl_type)
-            con_loss = torch.zeros(0).cuda()
-            #breakpoint()
+            con_loss = torch.zeros(1).cuda()
 
             if opt.rampup == 'up':
                 if epoch > 99:
@@ -222,9 +221,13 @@ for epoch in range(start_epoch, total_epoch):
                 con_weight = 1
             con_weight *= opt.con_weight
 
-            con_loss_ave.update(con_loss, 1)
+            con_loss_ave.update(con_loss.item(), 1)
+
+            # re fit with pseudo labels
+            train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_label[ind_].unsqueeze(0), train_pred[1][ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_pred[2][ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0))
             #breakpoint()
             loss = loss + sum(train_loss_ind[i] for i in range(len(tasks))) / len(image_index) + (con_loss * con_weight) / len(image_index)
+        
         train_loss = model.model_fit(train_pred[0], train_label, train_pred[1], train_depth, train_pred[2], train_normal)
 
         optimizer.zero_grad()
@@ -244,7 +247,7 @@ for epoch in range(start_epoch, total_epoch):
         cost[6] = train_loss[2].item()
         cost[7], cost[8], cost[9], cost[10], cost[11] = model.normal_error(train_pred[2], train_normal)
         avg_cost[index, :12] += cost[:12] / train_batch
-        ctl_cost[index, 0] += con_loss / train_batch
+        ctl_cost[index, 0] += con_loss.item() / train_batch
         bar.suffix  = '({batch}/{size}) | LossS: {loss_s:.4f} | LossD: {loss_d:.4f} | LossN: {loss_n:.4f} | Ws: {ws:.4f} | Wd: {wd:.4f}| Wn: {wn:.4f} | CTL: {ctl:.4f} | CW: {cw:.2f}'.format(
                     batch=k + 1,
                     size=train_batch,
@@ -284,7 +287,7 @@ for epoch in range(start_epoch, total_epoch):
                 test_data, test_label = test_data.cuda(),  test_label.type(torch.LongTensor).cuda()
                 test_depth, test_normal = test_depth.cuda(), test_normal.cuda()
 
-                test_pred, _, _ = model(test_data)
+                test_pred, _, _, _ = model(test_data)
                 test_loss = model.model_fit(test_pred[0], test_label, test_pred[1], test_depth, test_pred[2], test_normal)
 
                 conf_mat.update(test_pred[0].argmax(1).flatten(), test_label.flatten())
