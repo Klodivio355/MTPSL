@@ -21,4 +21,4 @@
 conda activate /scratch_tmp/grp/grv_shi/k21220263/conda/mtl-partial
 
 # run the application
-python nyu_mtl_xtc.py --out ./results/nyuv2 --ssl-type randomlabels --dataroot ./data/nyuv2
+python nyu_mtl_xtc.py --out ./results/nyuv2 --ssl-type onelabel --dataroot ./data/nyuv2

@@ -22,7 +22,7 @@ parser = argparse.ArgumentParser(description='Multi-task supervised learning (Se
 parser.add_argument('--type', default='standard', type=str, help='split type: standard, wide, deep')
 parser.add_argument('--weight', default='uniform', type=str, help='multi-task weighting: uniform')
 parser.add_argument('--dataroot', default='nyuv2', type=str, help='dataset root')
-parser.add_argument('--temp', default=1.0, type=float, help='temperature for DWA (must be positive)')
+parser.add_argument('--temp', defau#lt=1.0, type=float, help='temperature for DWA (must be positive)')
 parser.add_argument('--wlr', default=0.001, type=float, help='initial learning rate')
 parser.add_argument('--out', default='./results/nyuv2', help='Directory to output the result')
 parser.add_argument('--alpha', default=1.5, type=float, help='hyper params of GradNorm')

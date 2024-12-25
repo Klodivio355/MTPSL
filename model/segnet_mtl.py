@@ -26,19 +26,26 @@ class SegNet(nn.Module):
         self.backbone = Swinv2Model.from_pretrained("microsoft/swinv2-tiny-patch4-window8-256", cache_dir='hf_cache')
 
         # define task specific layers
-        self.teacher_task1 = DecoderWithCrossAttention(512, 5, 1)
-        self.student_task1 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
-                                        nn.Conv2d(in_channels=filter[0], out_channels=self.class_nb, kernel_size=1, padding=0))
+        self.teacher_task1 = DecoderWithCrossAttention2(512, 5, self.class_nb)
+        self.student_task1 = DecoderWithCrossAttention2(512, 5, self.class_nb)
+        #self.student_task1 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+        #                                nn.Conv2d(in_channels=filter[0], out_channels=self.class_nb, kernel_size=1, padding=0))
+        #self.student_task1 = DecoderWithCrossAttention(512, 5, 1)
 
-        self.teacher_task2 = DecoderWithCrossAttention(512, 5, 1)
-        self.student_task2 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
-                                        nn.Conv2d(in_channels=filter[0], out_channels=1, kernel_size=1, padding=0))
+        self.teacher_task2 = DecoderWithCrossAttention2(512, 5, 1)
+        self.student_task2 = DecoderWithCrossAttention2(512, 5, 1)
+        #self.student_task2 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+        #                                nn.Conv2d(in_channels=filter[0], out_channels=1, kernel_size=1, padding=0))
+        #self.student_task2 = DecoderWithCrossAttention(512, 5, 1)
 
-        self.teacher_task3 = DecoderWithCrossAttention(512, 5, 3)
-        self.student_task3 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
-                                        nn.Conv2d(in_channels=filter[0], out_channels=3, kernel_size=1, padding=0))
+        self.teacher_task3 = DecoderWithCrossAttention2(512, 5, 3)
+        self.student_task3 = DecoderWithCrossAttention2(512, 5, 3)
+        #self.student_task3 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+        #                                nn.Conv2d(in_channels=filter[0], out_channels=3, kernel_size=1, padding=0))
+        #self.student_task3 = DecoderWithCrossAttention(512, 5, 3)
 
         self.teachers = nn.ModuleList([self.teacher_task1, self.teacher_task2, self.teacher_task3])
+        self.students = nn.ModuleList([self.student_task1, self.student_task2, self.student_task3])
         self.channel_reduction = nn.Conv2d(2208, 512, kernel_size=1, stride=1, bias=False)
 
         # define pooling and unpooling functions
@@ -73,8 +80,19 @@ class SegNet(nn.Module):
 
         return [t1_pred, t2_pred, t3_pred], self.logsigma, feat, latent_representation
 
+    #def ema_update(alpha=0.98):
+    #    for i in range(3):
+    #        for teacher_param, student_param in zip(self.teachers[i].paraneters(), self.students[i].parameters()):
+    #            teacher_param.data = alpha * teacher_param.data + (1 - alpha) * student_param.data
+
     def teacher_forward(self, x, index, gts):
-        prediction = self.teachers[index](x, gts)
+        if index == 0:
+            prediction = torch.argmax(F.log_softmax(self.teachers[index](x, aux_input=gts), dim=1), dim=1)
+        elif index == 1:
+            prediction = self.teachers[index](x, aux_input=gts)
+        elif index == 2:
+            prediction = self.teachers[index](x, aux_input=gts)
+            prediction = prediction / torch.norm(prediction, p=2, dim=1, keepdim=True)
         return prediction
 
     def model_fit(self, x_pred1, x_output1, x_pred2, x_output2, x_pred3, x_output3):
@@ -208,6 +226,29 @@ class SegNet(nn.Module):
         error = np.degrees(error)
         return np.mean(error), np.median(error), np.mean(error < 11.25), np.mean(error < 22.5), np.mean(error < 30)
 
+
+class DecoderWithCrossAttention2(nn.Module):
+    def __init__(self, in_channels, aux_dim, output_channels, num_heads=4):
+        super().__init__()
+        # Transposed Convolution for Upsampling
+        self.gate = nn.Conv2d(in_channels=in_channels*2, out_channels=1, kernel_size=1)
+        self.project_aux = nn.Conv2d(in_channels=aux_dim, out_channels=in_channels, kernel_size=1)
+        self.conv_out = nn.Conv2d(in_channels=in_channels, out_channels=output_channels, kernel_size=3, padding=1)
+        
+    def forward(self, x, aux_input=None):
+        # Initial Conv Layer
+        if aux_input is not None:
+            projected_aux = self.project_aux(aux_input)
+            combined = torch.cat([x, projected_aux], dim=1) 
+            gate = torch.sigmoid(self.gate(combined))
+
+            x = gate * x + (1 - gate) * projected_aux
+
+        out = self.conv_out(x)
+
+        return out
+
+
 class DecoderWithCrossAttention(nn.Module):
     def __init__(self, in_channels, aux_dim, output_channels, num_heads=4):
         super().__init__()
@@ -216,73 +257,100 @@ class DecoderWithCrossAttention(nn.Module):
         self.upsample = nn.ConvTranspose2d(in_channels, output_channels, kernel_size=(4, 4), stride=(4, 4), padding=(1,1), output_padding=(0,0))
         
         # Cross Attention
-        self.cross_attention = nn.MultiheadAttention(embed_dim=in_channels, num_heads=num_heads, batch_first=True)
-        #self.cross_attention = CrossAttentionLayer
-        # Optional LayerNorm for stability
+        num_layers = 3
+        self.layers = nn.ModuleList(
+            [CrossAttentionLayer(embed_dim=512, num_heads=4, dropout=0.1) for _ in range(num_layers)]
+        )
+        #self.cross_attention = nn.MultiheadAttention(embed_dim=in_channels, num_heads=num_heads, batch_first=True)
+    
+        # Linear Layer
         self.linear = nn.Linear(5, 512)
+
+        # Normalisation Layer
         self.norm = nn.LayerNorm(in_channels)
+
+        # Pooling Layers to reduce complexity
+        # 2D
         self.pool1 = nn.MaxPool2d(kernel_size=4, stride=2)
         self.pool2 = nn.MaxPool2d(kernel_size=4, stride=2)
 
+        # 1D
         self.pool1D = nn.AvgPool1d(kernel_size=4, stride=4)
         self.pool1D2 = nn.AvgPool1d(kernel_size=4, stride=4)
         
-    def forward(self, x, aux_input):
+    def forward(self, x, aux_input=None):
         # Initial Conv Layer
         x = self.conv1(x)
         # Cross-Attention: Skip if no aux_input
+        
+        x = self.pool1(x)
+        B, C, H, W = x.shape
+
         if aux_input is not None:
-            #breakpoint()
-            x = self.pool1(x)
             aux_input = self.pool2(aux_input)
-            #breakpoint()
-            B, C, H, W = x.shape
             B_, C_, H_, W_ = aux_input.shape
-            # Flatten spatial dimensions for MultiheadAttention
-            x_flat = x.view(B, C, -1).permute(0, 2, 1)  # (batch_size, seq_len, in_channels)
+
+        # Flatten spatial dimensions for MultiheadAttention
+        x_flat = x.view(B, C, -1).permute(0, 2, 1)  # (batch_size, seq_len, in_channels)
+
+        if aux_input is not None:
             aux_flat = aux_input.view(B_, C_, -1).permute(0, 2, 1)  # (batch_size, seq_len, aux_dim)
             aux_flat = self.linear(aux_flat)
 
-            A, D = 165, 165
-            x_pool = x_flat.transpose(1, 2)  # [Batch, Embedding Size, Sequence Length]
-            x_pooled = self.pool1D(x_pool).transpose(1, 2)  # [1, 6828, 512]
+        A, D = 165, 165
+        x_pool = x_flat.transpose(1, 2)  # [Batch, Embedding Size, Sequence Length]
+        x_pooled = self.pool1D(x_pool).transpose(1, 2)  # [1, 6828, 512]
+
+        if aux_input is not None:
             aux_pool = aux_flat.transpose(1, 2)  # [Batch, Embedding Size, Sequence Length]
             aux_pooled = self.pool1D2(aux_pool).transpose(1, 2)  # [1, 6828, 512]
-            # Cross-Attention
-            attended_x, _ = self.cross_attention(query=x_pooled, key=aux_pooled, value=aux_pooled)
-            target_seq_len = 6889
-            padding_len = target_seq_len - attended_x.size(1)  # 6889 - 6828 = 61
-            attended_x = torch.nn.functional.pad(attended_x, (0, 0, 0, padding_len))
-            x = attended_x.permute(0, 2, 1).view(B, C, 83, 83)  # Reshape back to spatial dims
-            # Optional normalization
-            x = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+        # Cross-Attention
+        #attended_x, _ = self.cross_attention(query=x_pooled, key=aux_pooled, value=aux_pooled)
+        if aux_input is not None:
+            for layer in self.layers:
+                x_pooled = layer(query=x_pooled, key=aux_pooled, value=aux_pooled)
+        else:
+            for layer in self.layers:
+                x_pooled = layer(query=x_pooled, key=x_pooled, value=x_pooled)
+
+        attended_x = x_pooled
+        target_seq_len = 6889
+        padding_len = target_seq_len - attended_x.size(1)  # 6889 - 6828 = 61
+        attended_x = torch.nn.functional.pad(attended_x, (0, 0, 0, padding_len))
+        x = attended_x.permute(0, 2, 1).view(B, C, 83, 83)  # Reshape back to spatial dims
+
+        # Normalization
+        x = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            
         # Transposed Convolution for Upsampling
         x = self.upsample(x)
         x = F.interpolate(x, size=(288, 384), mode='bilinear', align_corners=False)
         return x
 
 class CrossAttentionLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1):
+    def __init__(self, embed_dim, num_heads, dropout=0.1):
         super(CrossAttentionLayer, self).__init__()
         self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, ff_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, embed_dim),
-            nn.Dropout(dropout)
-        )
         self.norm2 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.ReLU(),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, query, key, value):
         # Multi-head cross-attention
         attn_output, _ = self.multihead_attn(query, key, value)
-        attn_output = self.norm1(attn_output + query)
+        query = query + self.dropout(attn_output)
+        query = self.norm1(query)
 
         # Feed-forward network
         ffn_output = self.ffn(attn_output)
-        output = self.norm2(ffn_output + attn_output)
+        query = query + self.dropout(ffn_output)
+        output = self.norm2(query)
 
         return output
 

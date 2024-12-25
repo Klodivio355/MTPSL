@@ -75,20 +75,17 @@ mapfns = Mapfns(tasks=tasks, input_channels=input_channels).cuda()
 params = []
 params += model.parameters()
 
-params += [v for k, v in mapfns.named_parameters() if 'gamma' not in k and 'beta' not in k]
+#params += [v for k, v in mapfns.named_parameters() if 'gamma' not in k and 'beta' not in k]
 optimizer = optim.Adam(params, lr=1e-4)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
-params_film = [v for k, v in mapfns.named_parameters() if 'gamma' in k or 'beta' in k]
+
 # optimizer for the conditional auxiliary network
-optimizer_film = optim.Adam(params_film, lr=1e-3)
-scheduler_film = optim.lr_scheduler.StepLR(optimizer_film, step_size=30, gamma=0.5)
 start_epoch = 0
 if opt.resume:
     checkpoint = torch.load(opt.resume)
     model.load_state_dict(checkpoint['state_dict'], strict=True)
     start_epoch = checkpoint['epoch']
     optimizer.load_state_dict(checkpoint['optimizer'])
-    optimizer_film.load_state_dict(checkpoint['optimizer_film'])
     print('=> checkpoint from {} loaded!'.format(opt.resume))
 
 
@@ -122,7 +119,6 @@ nyuv2_test_loader = torch.utils.data.DataLoader(
     batch_size=batch_size,
     shuffle=False, num_workers=0)
 
-
 # define parameters
 total_epoch = 200
 train_batch = len(nyuv2_train_loader)
@@ -136,7 +132,7 @@ isbest=False
 
 for epoch in range(start_epoch, total_epoch):
     index = epoch
-    print('lr at {}th epoch is {} for optimizer and {} for film'.format(index, optimizer.param_groups[0]['lr'], optimizer_film.param_groups[0]['lr']))
+    print('lr at {}th epoch is {} for optimizer'.format(index, optimizer.param_groups[0]['lr']))
     cost = np.zeros(24, dtype=np.float32)
 
     # apply Dynamic Weight Average
@@ -155,6 +151,10 @@ for epoch in range(start_epoch, total_epoch):
 
     # iteration for all batches
     model.train()
+    #for teacher in model.teachers:
+    #    for param in teacher.parameters():
+    #        param.requires_grad = False
+
     mapfns.train()
 
     con_loss_ave = AverageMeter()
@@ -168,34 +168,42 @@ for epoch in range(start_epoch, total_epoch):
         train_depth, train_normal = train_depth.cuda(), train_normal.cuda()
         train_data1, train_label1 = train_data1.cuda(), train_label1.type(torch.LongTensor).cuda()
         train_depth1, train_normal1 = train_depth1.cuda(), train_normal1.cuda()
-        
         train_data_ = torch.cat([train_data, train_data1], dim=0)
+
+        # Acquire prediction for all tasks
         train_pred, logsigma, feat, latent_representation = model(train_data_)
         feat_aug = feat[0][batch_size:]
         feat = feat[0][:batch_size]
         train_pred_aug = [train_pred[0][batch_size:], train_pred[1][batch_size:], train_pred[2][batch_size:]]
         train_pred = [train_pred[0][:batch_size], train_pred[1][:batch_size], train_pred[2][:batch_size]]
         loss = 0
+
         for ind_ in range(len(image_index)):
+            # Read what tasks what should be supervised
             if opt.ssl_type == 'full':
-                weighting = torch.ones(len(tasks)).float().cuda()
+                we = torch.ones(len(tasks)).float().cuda()
             else:
                 we = labels_weights[image_index[ind_]].clone().float().cuda()
+
+            # Get Prediction for all tasks
             train_pred_seg = train_pred_aug[0][ind_][None,:,:,:]
             train_pred_depth = train_pred_aug[1][ind_][None,:,:,:]
             train_pred_normal = train_pred_aug[2][ind_][None,:,:,:]
             _sc, _h, _w, _i, _j, height, width = trans_params[ind_]
             _h, _w, _i, _j, height, width = int(_h), int(_w), int(_i), int(_j), int(height), int(width)
             
-            train_target_ind = [train_label1[ind_].unsqueeze(0), train_depth1[ind_].unsqueeze(0), train_normal1[ind_].unsqueeze(0)]
+            train_target_ind = [train_label[ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0)]
             train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_label[ind_].unsqueeze(0), train_pred[1][ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_pred[2][ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0))
+
             for i in range(len(tasks)):
                 if we[i] == 0:
                     train_loss_ind[i] = 0
             train_pred_ind = [train_pred_seg, train_pred_depth, train_pred_normal]
 
-            gts = torch.cat([train_target_ind[0].unsqueeze(1), train_target_ind[1], train_target_ind[2]], dim=1)
+            # Get Ground truth 
+            gts = torch.cat([train_target_ind[0].unsqueeze(0), train_target_ind[1], train_target_ind[2]], dim=1)
 
+            # If task is supervised, then zero out respective channels in the ground truth 
             if we[0] == 1:
                 gts[0][0] = 0
             if we[1] == 1:
@@ -203,13 +211,15 @@ for epoch in range(start_epoch, total_epoch):
             if we[2] == 1:
                 gts[0][2:5] = 0
             
+            # If task is unsupervised 
+            #
+            #train_target_ind[0] = train_target_ind[0].unsqueeze(0)
             for i, tag in enumerate(copy.deepcopy(we)):
                 if tag == 0: # if task is unsupervised
-                    refined_prediction = model.teacher_forward(latent_representation[i].unsqueeze(0), i, gts)
-                    #train_pred[i][ind_] = refined_prediction
-                    train_target_ind[i] = refined_prediction
-                    
-            #con_loss = mapfns(train_pred_ind, train_target_ind, feat_aug[ind_].unsqueeze(0), copy.deepcopy(we), ssl_type=opt.ssl_type)
+                    pseudo_label = model.teacher_forward(latent_representation[i].unsqueeze(0), i, gts)
+                    train_target_ind[i] = pseudo_label
+                
+            # Zero contrastive loss to comply with MTPSL implementation
             con_loss = torch.zeros(1).cuda()
 
             if opt.rampup == 'up':
@@ -223,18 +233,18 @@ for epoch in range(start_epoch, total_epoch):
 
             con_loss_ave.update(con_loss.item(), 1)
 
-            # re fit with pseudo labels
-            train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_label[ind_].unsqueeze(0), train_pred[1][ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_pred[2][ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0))
-            #breakpoint()
+            # refit with pseudo labels as gt expect for 
+            #train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_target_ind[0].to(dtype=torch.int64), train_pred[1][ind_].unsqueeze(0), train_target_ind[1], train_pred[2][ind_].unsqueeze(0), train_target_ind[2])
+
             loss = loss + sum(train_loss_ind[i] for i in range(len(tasks))) / len(image_index) + (con_loss * con_weight) / len(image_index)
         
+        #breakpoint()
         train_loss = model.model_fit(train_pred[0], train_label, train_pred[1], train_depth, train_pred[2], train_normal)
 
         optimizer.zero_grad()
-        optimizer_film.zero_grad()
         loss.backward()
         optimizer.step()
-        optimizer_film.step()
+        #model.ema_update()
         
         cost_seg.update(train_loss[0].item(), batch_size)
         cost_depth.update(train_loss[1].item(), batch_size)
@@ -304,7 +314,6 @@ for epoch in range(start_epoch, total_epoch):
             normal_metric = normal_mat.get_score()
             avg_cost[index, 19], avg_cost[index, 20], avg_cost[index, 21], avg_cost[index, 22], avg_cost[index, 23] = normal_metric['mean'], normal_metric['rmse'], normal_metric['11.25'], normal_metric['22.5'], normal_metric['30']
         scheduler.step()
-        scheduler_film.step()
 
         mtl_performance = 0.0
         mtl_performance += (avg_cost[index, 13]* 100 - stl_performance[opt.ssl_type]['semantic']) / stl_performance[opt.ssl_type]['semantic']
@@ -334,10 +343,8 @@ for epoch in range(start_epoch, total_epoch):
     save_checkpoint({
             'epoch': epoch + 1,
             'state_dict': model.state_dict(),
-            'mapfns': mapfns.state_dict(),
             'best_performance': best_performance,
             'optimizer' : optimizer.state_dict(),
-            'optimizer_film': optimizer_film.state_dict(),
             'avg_cost': avg_cost,
         }, isbest) 
 print('Epoch: {:04d} | TRAIN: {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} '
