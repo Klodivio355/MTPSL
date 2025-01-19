@@ -34,7 +34,11 @@ class Attention(nn.Module):
 
         self.heads = heads
         self.scale = dim_head ** -0.5
+        self.inner_dim = inner_dim
+        self.heads = heads
+        self.dim_head = dim_head
 
+        self.norm2 = nn.LayerNorm(dim)
         self.norm = nn.LayerNorm(dim)
 
         self.attend = nn.Softmax(dim = -1)
@@ -47,20 +51,25 @@ class Attention(nn.Module):
             nn.Dropout(dropout)
         ) if project_out else nn.Identity()
 
-    def forward(self, x):
-        x = self.norm(x)
-
-        qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
-
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-
+    def forward(self, x, aux):
+        qu = self.norm(x)
+        if aux is not None:
+            k = self.norm2(aux)
+            v = k
+        else:
+            k = qu
+            v = qu
+        qkv = (qu, k, v)
+        qu, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+        dots = torch.matmul(qu, k.transpose(-1, -2)) * self.scale
         attn = self.attend(dots)
         attn = self.dropout(attn)
 
         out = torch.matmul(attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
+        breakpoint()
         return self.to_out(out)
+
 
 class Transformer(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
@@ -73,9 +82,9 @@ class Transformer(nn.Module):
                 FeedForward(dim, mlp_dim, dropout = dropout)
             ]))
 
-    def forward(self, x):
+    def forward(self, x, aux):
         for attn, ff in self.layers:
-            x = attn(x) + x
+            x = attn(x, aux) + x
             x = ff(x) + x
 
         return self.norm(x)
@@ -90,6 +99,7 @@ class ViT(nn.Module):
 
         num_patches = (image_height // patch_height) * (image_width // patch_width)
         patch_dim = channels * patch_height * patch_width
+        aux_dim = 5 * patch_height * patch_width
         assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
 
         self.to_patch_embedding = nn.Sequential(
@@ -99,10 +109,19 @@ class ViT(nn.Module):
             nn.LayerNorm(dim),
         )
 
+        self.to_patch_embedding2 = nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
+            nn.LayerNorm(aux_dim),
+            nn.Linear(aux_dim, dim),
+            nn.LayerNorm(dim),
+        )
+
         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
         self.query_query_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
 
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.cls_token2 = nn.Parameter(torch.randn(1, 1, dim))
+
         self.dropout = nn.Dropout(emb_dropout)
 
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
@@ -113,43 +132,26 @@ class ViT(nn.Module):
         self.fc = nn.Linear(dim, image_height * image_width)
         self.conv = nn.Conv2d(output_dim, output_dim, kernel_size=3, padding=1)
 
-        self.mlp_head = nn.Linear(dim, num_classes)
-
     def forward(self, img, aux=None):
         x = self.to_patch_embedding(img)
         b, n, _ = x.shape
-
         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
         x = torch.cat((cls_tokens, x), dim=1)
         x += self.pos_embedding[:, :(n + 1)]
+        
         if aux is not None:
-            query_pos = self.query_query_embedding[:, :(n+1)]
-            x = torch.cat((x, aux + query_pos))
-            breakpoint()
+            aux = self.to_patch_embedding2(aux)
+            b1, n1, _ = aux.shape
+            cls_tokens2 = repeat(self.cls_token2, '1 1 d -> b 1 d', b = b1)
+            aux = torch.cat((cls_tokens2, aux), dim=1)
+            aux += self.query_query_embedding[:, :(n+1)]
+            aux = self.dropout(aux)
+
         x = self.dropout(x)
-        x = self.transformer(x)
+        x = self.transformer(x, aux=aux)
         x = self.fc(x)
-        x = x.view(img.size(0), self.output_dim, img.size(2), img.size(3))
+        breakpoint()
+        #x = x.view(img.size(0), self.output_dim, img.size(2), img.size(3))
         x = self.conv(x)
         x = self.to_latent(x)
-
         return x
-
-v = ViT(
-    image_size = (288, 384),
-    patch_size = 96,
-    num_classes = 1000,
-    dim = 512,
-    depth = 4,
-    heads = 8,
-    mlp_dim = 2048,
-    dropout = 0.1,
-    emb_dropout = 0.1,
-    output_dim=13
-)
-
-x = torch.randn(1, 512, 288, 384)
-aux = torch.randn(1, 5, 288, 384)
-
-output = v(x, aux)
-breakpoint()

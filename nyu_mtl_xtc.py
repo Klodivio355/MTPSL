@@ -17,6 +17,7 @@ import numpy as np
 import pdb
 from progress.bar import Bar as Bar
 from utils import Logger, AverageMeter, accuracy, mkdir_p, savefig
+from utils.misc import confidence_filter, softmax_mse_loss, get_current_consistency_weight, dynamic_thresholding
 from torch.autograd import Variable
 import copy
 
@@ -67,7 +68,6 @@ title = 'NYUv2'
 logger = Logger(os.path.join(opt.out, 'mtl_xtc_{}_{}_{}_{}_log.txt'.format(opt.ssl_type, opt.rampup, opt.con_weight, opt.reg_weight)), title=title)
 logger.set_names(['Epoch', 'T.Ls', 'T. mIoU', 'T. Pix', 'T.Ld', 'T.abs', 'T.rel', 'T.Ln', 'T.Mean', 'T.Med', 'T.11', 'T.22', 'T.30',
     'V.Ls', 'V. mIoU', 'V. Pix', 'V.Ld', 'V.abs', 'V.rel', 'V.Ln', 'V.Mean', 'V.Med', 'V.11', 'V.22', 'V.30', 'Con L', 'Ws', 'Wd', 'Wn'])
-
 
 # define model, optimiser and scheduler
 model = SegNet(type_=opt.type, class_nb=13).cuda()
@@ -120,21 +120,21 @@ nyuv2_test_loader = torch.utils.data.DataLoader(
     shuffle=False, num_workers=0)
 
 # define parameters
-total_epoch = 200
+total_epoch = 300
 train_batch = len(nyuv2_train_loader)
 test_batch = len(nyuv2_test_loader)
 T = opt.temp
-avg_cost = np.zeros([total_epoch, 24], dtype=np.float32)
+avg_cost = np.zeros([total_epoch, 26], dtype=np.float32)
 ctl_cost = np.zeros([total_epoch, 1], dtype=np.float32)
 lambda_weight = np.zeros([3, total_epoch])
 best_performance = -100
 isbest=False
+global_step = 0
 
 for epoch in range(start_epoch, total_epoch):
     index = epoch
     print('lr at {}th epoch is {} for optimizer'.format(index, optimizer.param_groups[0]['lr']))
-    cost = np.zeros(24, dtype=np.float32)
-
+    cost = np.zeros(26, dtype=np.float32)
     # apply Dynamic Weight Average
     if opt.weight == 'dwa':
         if index == 0 or index == 1:
@@ -151,9 +151,9 @@ for epoch in range(start_epoch, total_epoch):
 
     # iteration for all batches
     model.train()
-    #for teacher in model.teachers:
-    #    for param in teacher.parameters():
-    #        param.requires_grad = False
+    for teacher in model.teachers:
+        for param in teacher.parameters():
+            param.detach_()
 
     mapfns.train()
 
@@ -161,7 +161,11 @@ for epoch in range(start_epoch, total_epoch):
     cost_seg = AverageMeter()
     cost_depth = AverageMeter()
     cost_normal = AverageMeter()
+    cost_consistency = AverageMeter()
+    cost_confidence_teacher = AverageMeter()
+    cost_confidence_student = AverageMeter()
     nyuv2_train_dataset = iter(nyuv2_train_loader)
+    
     for k in range(train_batch):
         train_data, train_label, train_depth, train_normal, image_index, train_data1, train_label1, train_depth1, train_normal1, trans_params = next(iter(nyuv2_train_dataset))
         train_data, train_label = train_data.cuda(), train_label.type(torch.LongTensor).cuda()
@@ -172,13 +176,22 @@ for epoch in range(start_epoch, total_epoch):
 
         # Acquire prediction for all tasks
         train_pred, logsigma, feat, latent_representation = model(train_data_)
-        feat_aug = feat[0][batch_size:]
+        #feat_aug = feat[0][batch_size:]
         feat = feat[0][:batch_size]
-        train_pred_aug = [train_pred[0][batch_size:], train_pred[1][batch_size:], train_pred[2][batch_size:]]
+        #train_pred_aug = [train_pred[0][batch_size:], train_pred[1][batch_size:], train_pred[2][batch_size:]]
         train_pred = [train_pred[0][:batch_size], train_pred[1][:batch_size], train_pred[2][:batch_size]]
         loss = 0
+        mean_confidence = 0
+        counter = 1
+        count = 0
+        teacher_count = 0
+        student_count = 0
+        mean = 0
+        sem_pseudo_labels = []
 
         for ind_ in range(len(image_index)):
+            consistency_loss = 0
+            binary_mask = torch.ones(1, 1, 288, 384).type(torch.FloatTensor).cuda()
             # Read what tasks what should be supervised
             if opt.ssl_type == 'full':
                 we = torch.ones(len(tasks)).float().cuda()
@@ -186,39 +199,58 @@ for epoch in range(start_epoch, total_epoch):
                 we = labels_weights[image_index[ind_]].clone().float().cuda()
 
             # Get Prediction for all tasks
-            train_pred_seg = train_pred_aug[0][ind_][None,:,:,:]
-            train_pred_depth = train_pred_aug[1][ind_][None,:,:,:]
-            train_pred_normal = train_pred_aug[2][ind_][None,:,:,:]
+            #train_pred_seg = train_pred_aug[0][ind_][None,:,:,:]
+            #train_pred_depth = train_pred_aug[1][ind_][None,:,:,:]
+            #train_pred_normal = train_pred_aug[2][ind_][None,:,:,:]
             _sc, _h, _w, _i, _j, height, width = trans_params[ind_]
             _h, _w, _i, _j, height, width = int(_h), int(_w), int(_i), int(_j), int(height), int(width)
             
             train_target_ind = [train_label[ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0)]
-            train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_label[ind_].unsqueeze(0), train_pred[1][ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_pred[2][ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0))
+            train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_label[ind_].unsqueeze(0), train_pred[1][ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_pred[2][ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0), binary_mask)
+            #breakpoint()
 
             for i in range(len(tasks)):
                 if we[i] == 0:
                     train_loss_ind[i] = 0
-            train_pred_ind = [train_pred_seg, train_pred_depth, train_pred_normal]
+
+            #print(train_loss_ind)
+            #train_pred_ind = [train_pred_seg, train_pred_depth, train_pred_normal]
 
             # Get Ground truth 
             gts = torch.cat([train_target_ind[0].unsqueeze(0), train_target_ind[1], train_target_ind[2]], dim=1)
 
-            # If task is supervised, then zero out respective channels in the ground truth 
-            if we[0] == 1:
+            # If task is unsupervised, we zero out respective channels in the ground truth 
+            if we[0] == 0:
                 gts[0][0] = 0
-            if we[1] == 1:
+            if we[1] == 0:
                 gts[0][1] = 0
-            if we[2] == 1:
+            if we[2] == 0:
                 gts[0][2:5] = 0
+
+            seg_probabilities = F.softmax(torch.exp(train_pred[0][ind_].unsqueeze(0)), dim=1)
+            seg_confidence_mask = dynamic_thresholding(seg_probabilities).type(torch.FloatTensor).cuda()
+            #student_count = torch.sum(seg_confidence_mask == 1)
+            #student_count += torch.mean(seg_confidence_mask, dim=1).item()
             
-            # If task is unsupervised 
-            #
-            #train_target_ind[0] = train_target_ind[0].unsqueeze(0)
+            #sem_pseudo_labels.append(train_label[ind_].unsqueeze(0))
+            consistency_weight = 1
             for i, tag in enumerate(copy.deepcopy(we)):
-                if tag == 0: # if task is unsupervised
-                    pseudo_label = model.teacher_forward(latent_representation[i].unsqueeze(0), i, gts)
-                    train_target_ind[i] = pseudo_label
-                
+                if tag == 0 and epoch >= 10: # if task is unsupervised
+                    if i == 0:
+                        pseudo_label = model.teacher_forward(latent_representation[ind_].unsqueeze(0), i)
+                        #counter += 1
+                        seg_probabilities = F.softmax(torch.exp(pseudo_label), dim=1)
+                        #binary_mask = dynamic_thresholding(seg_probabilities).type(torch.FloatTensor).cuda()
+                        #teacher_count += torch.sum(binary_mask == 1).item() * 100 / 110592
+                        pseudo_label = seg_probabilities.max(1)[1]
+                        pseudo_label = pseudo_label.detach().clone().requires_grad_(False)
+                        #sem_pseudo_labels[ind_] = pseudo_label
+                        #consistency_loss += consistency_weight * F.nll_loss(train_pred[0][ind_].unsqueeze(0), pseudo_label.type(dtype=torch.LongTensor).cuda(), ignore_index=-1)
+                        #class_loss += F.nll_loss(train_pred[0][ind_].unsqueeze(0), pseudo_label.type(dtype=torch.LongTensor).cuda())
+                        train_target_ind[0] = pseudo_label
+                        consistency_weight = get_current_consistency_weight(epoch)
+
+            #breakpoint()
             # Zero contrastive loss to comply with MTPSL implementation
             con_loss = torch.zeros(1).cuda()
 
@@ -233,22 +265,42 @@ for epoch in range(start_epoch, total_epoch):
 
             con_loss_ave.update(con_loss.item(), 1)
 
-            # refit with pseudo labels as gt expect for 
+            #breakpoint()
+            # refit with pseudo labels as gt expect for (line below is the final with all pseudo labels for all tasks)
             #train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_target_ind[0].to(dtype=torch.int64), train_pred[1][ind_].unsqueeze(0), train_target_ind[1], train_pred[2][ind_].unsqueeze(0), train_target_ind[2])
+            train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_target_ind[0].to(dtype=torch.int64), train_pred[1][ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_pred[2][ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0), binary_mask)
+            
+            # re-zero
+            for i in range(len(tasks)):
+                if we[i] == 0 and i != 0:
+                    train_loss_ind[i] = 0
 
-            loss = loss + sum(train_loss_ind[i] for i in range(len(tasks))) / len(image_index) + (con_loss * con_weight) / len(image_index)
-        
-        #breakpoint()
+            #breakpoint()
+            #train_loss_ind[0] = train_loss_ind[0] * consistency_weight
+            #train_loss_ind[0] = train_loss_ind[0] * consistency_weight
+
+            loss = loss + sum(train_loss_ind[i] for i in range(len(tasks))) / len(image_index) + con_loss * con_weight / len(image_index)  
+
+        #breakpoint() #train_label to concatenation of train_target_ind[0]
+        #train_loss = model.model_fit(train_pred[0], train_label, train_pred[1], train_depth, train_pred[2], train_normal)
+
+        #sem_pseudo_labels = [tensor.unsqueeze(0).to(dtype=torch.long) for sublist in sem_pseudo_labels for tensor in sublist]
+        #sem_pseudo_labels = torch.cat(sem_pseudo_labels, dim=0)
         train_loss = model.model_fit(train_pred[0], train_label, train_pred[1], train_depth, train_pred[2], train_normal)
+        #breakpoint()
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        #model.ema_update()
+        model.update_ema(global_step)
+        global_step += 1
         
         cost_seg.update(train_loss[0].item(), batch_size)
         cost_depth.update(train_loss[1].item(), batch_size)
         cost_normal.update(train_loss[2].item(), batch_size)
+        cost_confidence_student.update(student_count, 1)
+        cost_confidence_teacher.update(teacher_count, counter)
+
         cost[0] = train_loss[0].item()
         cost[1] = model.compute_miou(train_pred[0], train_label).item()
         cost[2] = model.compute_iou(train_pred[0], train_label).item()
@@ -258,8 +310,8 @@ for epoch in range(start_epoch, total_epoch):
         cost[7], cost[8], cost[9], cost[10], cost[11] = model.normal_error(train_pred[2], train_normal)
         avg_cost[index, :12] += cost[:12] / train_batch
         ctl_cost[index, 0] += con_loss.item() / train_batch
-        bar.suffix  = '({batch}/{size}) | LossS: {loss_s:.4f} | LossD: {loss_d:.4f} | LossN: {loss_n:.4f} | Ws: {ws:.4f} | Wd: {wd:.4f}| Wn: {wn:.4f} | CTL: {ctl:.4f} | CW: {cw:.2f}'.format(
-                    batch=k + 1,
+        bar.suffix  = '({batch}/{size}) | LossS: {loss_s:.4f} | LossD: {loss_d:.4f} | LossN: {loss_n:.4f} | Ws: {ws:.4f} | Wd: {wd:.4f}| Wn: {wn:.4f} | CTL: {ctl:.4f} | CW: {cw:.2f} | SC: {cl:.2f} | TC: {mc:.2f}'.format(
+                    batch=k + 1,   
                     size=train_batch,
                     # loss_s=cost[1],
                     # loss_d=cost[3],
@@ -272,22 +324,25 @@ for epoch in range(start_epoch, total_epoch):
                     wn=we[2].data,
                     ctl=con_loss_ave.avg,
                     cw=con_weight,
+                    cl= cost_confidence_student.avg,
+                    mc = cost_confidence_teacher.avg
                     )
         bar.next()
     bar.finish()
 
 
     if opt.eval_last20 == 0:
-        evaluate = True
+        evaluate = True 
     elif opt.eval_last20 and (epoch + 1) > (total_epoch - 20):
-        evaluate = True
+        evaluate = True 
     else:
-        evaluate = False
+        evaluate = True # False
 
     # evaluating test data
     if evaluate:
         model.eval()
         conf_mat = ConfMatrix(model.class_nb)
+        conf_mat_teacher = ConfMatrix(model.class_nb)
         depth_mat = DepthMeter()
         normal_mat = NormalsMeter()
         with torch.no_grad():  # operations inside don't track history
@@ -297,22 +352,31 @@ for epoch in range(start_epoch, total_epoch):
                 test_data, test_label = test_data.cuda(),  test_label.type(torch.LongTensor).cuda()
                 test_depth, test_normal = test_depth.cuda(), test_normal.cuda()
 
-                test_pred, _, _, _ = model(test_data)
+                test_pred, _, _, latent_space = model(test_data)
+                teacher_seg_pred = model.teacher_forward(latent_space, 0)
+
                 test_loss = model.model_fit(test_pred[0], test_label, test_pred[1], test_depth, test_pred[2], test_normal)
 
                 conf_mat.update(test_pred[0].argmax(1).flatten(), test_label.flatten())
+                conf_mat_teacher.update(teacher_seg_pred.argmax(1).flatten(), test_label.flatten())
                 depth_mat.update(test_pred[1], test_depth)
                 normal_mat.update(test_pred[2], test_normal)
+
                 cost[12] = test_loss[0].item()
                 cost[15] = test_loss[1].item()
                 cost[18] = test_loss[2].item()
 
                 avg_cost[index, 12:] += cost[12:] / test_batch
+
             avg_cost[index, 13:15] = conf_mat.get_metrics()
             depth_metric = depth_mat.get_score()
             avg_cost[index, 16], avg_cost[index, 17] = depth_metric['l1'], depth_metric['rmse']
             normal_metric = normal_mat.get_score()
             avg_cost[index, 19], avg_cost[index, 20], avg_cost[index, 21], avg_cost[index, 22], avg_cost[index, 23] = normal_metric['mean'], normal_metric['rmse'], normal_metric['11.25'], normal_metric['22.5'], normal_metric['30']
+            #breakpoint()
+            avg_cost[index, 24:26] = conf_mat_teacher.get_metrics()
+        
+        #breakpoint()
         scheduler.step()
 
         mtl_performance = 0.0
@@ -324,12 +388,13 @@ for epoch in range(start_epoch, total_epoch):
         print('current performance: {:.4f}, best performance: {:.4f}'.format(mtl_performance, best_performance))
 
         print('Epoch: {:04d} | TRAIN: {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} '
-              'TEST: {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}'
+              'TEST: {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}, TEACHER: {:.4f} {:.4f}'
               .format(index, avg_cost[index, 0], avg_cost[index, 1], avg_cost[index, 2], avg_cost[index, 3],
                     avg_cost[index, 4], avg_cost[index, 5], avg_cost[index, 6], avg_cost[index, 7], avg_cost[index, 8], avg_cost[index, 9],
                     avg_cost[index, 10], avg_cost[index, 11], avg_cost[index, 12], avg_cost[index, 13],
                     avg_cost[index, 14], avg_cost[index, 15], avg_cost[index, 16], avg_cost[index, 17], avg_cost[index, 18],
-                    avg_cost[index, 19], avg_cost[index, 20], avg_cost[index, 21], avg_cost[index, 22], avg_cost[index, 23]))
+                    avg_cost[index, 19], avg_cost[index, 20], avg_cost[index, 21], avg_cost[index, 22], avg_cost[index, 23],
+                    avg_cost[index, 24], avg_cost[index, 25]))
         logger.append([index, avg_cost[index, 0], avg_cost[index, 1], avg_cost[index, 2], avg_cost[index, 3],
                     avg_cost[index, 4], avg_cost[index, 5], avg_cost[index, 6], avg_cost[index, 7], avg_cost[index, 8], avg_cost[index, 9],
                     avg_cost[index, 10], avg_cost[index, 11], avg_cost[index, 12], avg_cost[index, 13],

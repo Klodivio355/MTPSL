@@ -6,8 +6,9 @@ from torch.autograd import Variable
 import torch.nn.init as init
 import numpy as np
 import pdb
-from transformers import AutoImageProcessor, Swinv2Model
-
+from transformers import AutoImageProcessor, Swinv2Model, AutoModelForImageClassification, AutoImageProcessor, AutoModel, MobileNetV2Model
+from torch.optim.swa_utils import AveragedModel
+from model.vit import ViT
 # Define SegNet
 # The implementation of SegNet is from https://github.com/lorenmt/mtan
 
@@ -17,32 +18,137 @@ class SegNet(nn.Module):
         # initialise network parameters
         self.type = type_
         if self.type == 'wide':
-            filter = [512, 128, 256, 512, 1024]
+            #filter = [512, 128, 256, 512, 1024] # for swin
+            filter = [64, 128, 256, 512, 1024] # for cnn
         else:
-            filter = [512, 128, 256, 512, 512]
+            #filter = [512, 128, 256, 512, 512] # for swin
+            filter = [64, 128, 256, 512, 1024] # for cnn
 
         self.class_nb = class_nb
 
-        self.backbone = Swinv2Model.from_pretrained("microsoft/swinv2-tiny-patch4-window8-256", cache_dir='hf_cache')
+        #self.backbone = Swinv2Model.from_pretrained("microsoft/swinv2-tiny-patch4-window8-256", cache_dir='hf_cache')
+
+        # define encoder decoder layers
+        self.encoder_block = nn.ModuleList([self.conv_layer([3, filter[0]])])
+        self.decoder_block = nn.ModuleList([self.conv_layer([filter[0], filter[0]])])
+        for i in range(4):
+            self.encoder_block.append(self.conv_layer([filter[i], filter[i + 1]]))
+            self.decoder_block.append(self.conv_layer([filter[i + 1], filter[i]]))
+
+        # define convolution layer
+        self.conv_block_enc = nn.ModuleList([self.conv_layer([filter[0], filter[0]])])
+        self.conv_block_dec = nn.ModuleList([self.conv_layer([filter[0], filter[0]])])
+        for i in range(4):
+            if i == 0:
+                self.conv_block_enc.append(self.conv_layer([filter[i + 1], filter[i + 1]]))
+                self.conv_block_dec.append(self.conv_layer([filter[i], filter[i]]))
+            else:
+                self.conv_block_enc.append(nn.Sequential(self.conv_layer([filter[i + 1], filter[i + 1]]),
+                                                         self.conv_layer([filter[i + 1], filter[i + 1]])))
+                self.conv_block_dec.append(nn.Sequential(self.conv_layer([filter[i], filter[i]]),
+                                                         self.conv_layer([filter[i], filter[i]])))
+
 
         # define task specific layers
-        self.teacher_task1 = DecoderWithCrossAttention2(512, 5, self.class_nb)
+        #self.teacher_task1 = DecoderWithCrossAttention2(512, 5, self.class_nb)
+        """         self.teacher_task1 = ViT(
+                                    image_size = (288, 384),
+                                    patch_size = 96,
+                                    num_classes = 1000,
+                                    dim = 128,
+                                    depth = 1,
+                                    heads = 4,
+                                    mlp_dim = 2048,
+                                    dropout = 0.1,
+                                    emb_dropout = 0.1,
+                                    output_dim=self.class_nb
+                                )
+        self.student_task1 = ViT(
+                                    image_size = (288, 384),
+                                    patch_size = 96,
+                                    num_classes = 1000,
+                                    dim = 128,
+                                    depth = 1,
+                                    heads = 4,
+                                    mlp_dim = 2048,
+                                    dropout = 0.1,
+                                    emb_dropout = 0.1,
+                                    output_dim=self.class_nb
+                                )
+
+        self.teacher_task2 = ViT(
+                                    image_size = (288, 384),
+                                    patch_size = 96,
+                                    num_classes = 1000,
+                                    dim = 128,
+                                    depth = 1,
+                                    heads = 4,
+                                    mlp_dim = 2048,
+                                    dropout = 0.1,
+                                    emb_dropout = 0.1,
+                                    output_dim=1
+                                )
+
+        self.student_task2 = ViT(
+                                    image_size = (288, 384),
+                                    patch_size = 96,
+                                    num_classes = 1000,
+                                    dim = 128,
+                                    depth = 1,
+                                    heads = 4,
+                                    mlp_dim = 2048,
+                                    dropout = 0.1,
+                                    emb_dropout = 0.1,
+                                    output_dim=1
+                                )
+
+        self.teacher_task3 = ViT(
+                                    image_size = (288, 384),
+                                    patch_size = 96,
+                                    num_classes = 1000,
+                                    dim = 128,
+                                    depth = 1,
+                                    heads = 4,
+                                    mlp_dim = 2048,
+                                    dropout = 0.1,
+                                    emb_dropout = 0.1,
+                                    output_dim=3
+                                )
+        self.student_task3 = ViT(
+                                    image_size = (288, 384),
+                                    patch_size = 96,
+                                    num_classes = 1000,
+                                    dim = 128,
+                                    depth = 1,
+                                    heads = 4,
+                                    mlp_dim = 2048,
+                                    dropout = 0.1,
+                                    emb_dropout = 0.1,
+                                    output_dim=3
+                                )      """                    
+
+        self.student_task1 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+                                        nn.Conv2d(in_channels=filter[0], out_channels=self.class_nb, kernel_size=1, padding=0))
+        self.teacher_task1 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+                                        nn.Conv2d(in_channels=filter[0], out_channels=self.class_nb, kernel_size=1, padding=0))
+        self.student_task2 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+                                        nn.Conv2d(in_channels=filter[0], out_channels=1, kernel_size=1, padding=0))
+        self.teacher_task2 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+                                        nn.Conv2d(in_channels=filter[0], out_channels=1, kernel_size=1, padding=0))
+        self.student_task3 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+                                        nn.Conv2d(in_channels=filter[0], out_channels=3, kernel_size=1, padding=0))
+        self.teacher_task3 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
+                                        nn.Conv2d(in_channels=filter[0], out_channels=3, kernel_size=1, padding=0))
+
+        """ self.teacher_task1 = DecoderWithCrossAttention2(512, 5, self.class_nb)
         self.student_task1 = DecoderWithCrossAttention2(512, 5, self.class_nb)
-        #self.student_task1 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
-        #                                nn.Conv2d(in_channels=filter[0], out_channels=self.class_nb, kernel_size=1, padding=0))
-        #self.student_task1 = DecoderWithCrossAttention(512, 5, 1)
 
         self.teacher_task2 = DecoderWithCrossAttention2(512, 5, 1)
         self.student_task2 = DecoderWithCrossAttention2(512, 5, 1)
-        #self.student_task2 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
-        #                                nn.Conv2d(in_channels=filter[0], out_channels=1, kernel_size=1, padding=0))
-        #self.student_task2 = DecoderWithCrossAttention(512, 5, 1)
 
         self.teacher_task3 = DecoderWithCrossAttention2(512, 5, 3)
-        self.student_task3 = DecoderWithCrossAttention2(512, 5, 3)
-        #self.student_task3 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
-        #                                nn.Conv2d(in_channels=filter[0], out_channels=3, kernel_size=1, padding=0))
-        #self.student_task3 = DecoderWithCrossAttention(512, 5, 3)
+        self.student_task3 = DecoderWithCrossAttention2(512, 5, 3) """
+    
 
         self.teachers = nn.ModuleList([self.teacher_task1, self.teacher_task2, self.teacher_task3])
         self.students = nn.ModuleList([self.student_task1, self.student_task2, self.student_task3])
@@ -63,14 +169,45 @@ class SegNet(nn.Module):
 
     def forward(self, x):
 
-        feature_maps = self.backbone(x, output_hidden_states=True).reshaped_hidden_states
+        #feature_maps = self.backbone(x, output_hidden_states=True).reshaped_hidden_states
+        """ feature_maps = self.backbone(x, output_hidden_states=True).hidden_states
+        #breakpoint()
         interpolated_features = [
             F.interpolate(f, size=(288, 384), mode='bilinear', align_corners=False)
             for f in feature_maps
         ]
-
+        #breakpoint()
         feat = feature_maps[-1]
-        latent_representation = self.channel_reduction(torch.cat(interpolated_features, dim=1))  
+        latent_representation = self.channel_reduction(torch.cat(interpolated_features, dim=1))   """
+
+        g_encoder, g_decoder, g_maxpool, g_upsampl, indices = ([0] * 5 for _ in range(5))
+        for i in range(5):
+            g_encoder[i], g_decoder[-i - 1] = ([0] * 2 for _ in range(2))
+
+        # global shared encoder-decoder network
+        for i in range(5):
+            if i == 0:
+                g_encoder[i][0] = self.encoder_block[i](x)
+                g_encoder[i][1] = self.conv_block_enc[i](g_encoder[i][0])
+                g_maxpool[i], indices[i] = self.down_sampling(g_encoder[i][1])
+            else:
+                g_encoder[i][0] = self.encoder_block[i](g_maxpool[i - 1])
+                g_encoder[i][1] = self.conv_block_enc[i](g_encoder[i][0])
+                g_maxpool[i], indices[i] = self.down_sampling(g_encoder[i][1])
+        feat = [g_maxpool[i]]
+        # feat = [g_maxpool]
+        for i in range(5):
+            if i == 0:
+                g_upsampl[i] = self.up_sampling(g_maxpool[-1], indices[-i - 1])
+                g_decoder[i][0] = self.decoder_block[-i - 1](g_upsampl[i])
+                g_decoder[i][1] = self.conv_block_dec[-i - 1](g_decoder[i][0])
+            else:
+                g_upsampl[i] = self.up_sampling(g_decoder[i - 1][-1], indices[-i - 1])
+                g_decoder[i][0] = self.decoder_block[-i - 1](g_upsampl[i])
+                g_decoder[i][1] = self.conv_block_dec[-i - 1](g_decoder[i][0])
+
+        feat.append(g_decoder[i][1])
+        latent_representation = g_decoder[i][1]
 
         # define task prediction layers
         t1_pred = F.log_softmax(self.student_task1(latent_representation), dim=1)
@@ -80,22 +217,59 @@ class SegNet(nn.Module):
 
         return [t1_pred, t2_pred, t3_pred], self.logsigma, feat, latent_representation
 
-    #def ema_update(alpha=0.98):
-    #    for i in range(3):
-    #        for teacher_param, student_param in zip(self.teachers[i].paraneters(), self.students[i].parameters()):
-    #            teacher_param.data = alpha * teacher_param.data + (1 - alpha) * student_param.data
+    def conv_layer(self, channel):
+        if self.type == 'deep':
+            conv_block = nn.Sequential(
+                nn.Conv2d(in_channels=channel[0], out_channels=channel[1], kernel_size=3, padding=1),
+                nn.BatchNorm2d(num_features=channel[1]),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_channels=channel[1], out_channels=channel[1], kernel_size=3, padding=1),
+                nn.BatchNorm2d(num_features=channel[1]),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            conv_block = nn.Sequential(
+                nn.Conv2d(in_channels=channel[0], out_channels=channel[1], kernel_size=3, padding=1),
+                nn.BatchNorm2d(num_features=channel[1]),
+                nn.ReLU(inplace=True)
+            )
+        return conv_block
 
-    def teacher_forward(self, x, index, gts):
+    def ema_update(self, alpha=0.99):
+        for i in range(len(self.teachers)):
+            for teacher_param, student_param in zip(self.teachers[i].parameters(), self.students[i].parameters()):
+                teacher_param.data = alpha * teacher_param.data + (1 - alpha) * student_param.data
+
+    def update_ema(self, global_step, alpha=0.99):
+        """
+        https://github.com/colinlaganier/MeanTeacherSegmentation/blob/main/main.py
+        Update the ema model weights with the model weights
+        Args:
+            model (torch.nn.Module): model
+            ema_model (torch.nn.Module): ema model
+            alpha (float): alpha
+            global_step (int): global step
+        """
+        
+        # Set alpha to 0.999 at the beginning and then linearly decay
+        alpha = min(1 - 1 / (global_step + 1), alpha)
+        for i in range(len(self.teachers)):
+            for teacher_param, student_param in zip(self.teachers[i].parameters(), self.students[i].parameters()):
+                teacher_param.data.mul_(alpha).add_(student_param.data, alpha=1 - alpha)
+
+    def teacher_forward(self, x, index, gts=None):
         if index == 0:
-            prediction = torch.argmax(F.log_softmax(self.teachers[index](x, aux_input=gts), dim=1), dim=1)
+            #prediction = torch.argmax(F.log_softmax(self.teachers[index](x), dim=1), dim=1)
+             #prediction = F.softmax(self.teachers[index](x), dim=1).max(1)
+             prediction = F.log_softmax(self.teachers[index](x), dim=1)
         elif index == 1:
-            prediction = self.teachers[index](x, aux_input=gts)
+            prediction = self.teachers[index](x)
         elif index == 2:
-            prediction = self.teachers[index](x, aux_input=gts)
+            prediction = self.teachers[index](x)
             prediction = prediction / torch.norm(prediction, p=2, dim=1, keepdim=True)
         return prediction
 
-    def model_fit(self, x_pred1, x_output1, x_pred2, x_output2, x_pred3, x_output3):
+    def model_fit(self, x_pred1, x_output1, x_pred2, x_output2, x_pred3, x_output3, seg_binary_mask=None):
         # Compute supervised task-specific loss for all tasks when all task labels are available
 
         # binary mark to mask out undefined pixel space
@@ -103,8 +277,13 @@ class SegNet(nn.Module):
         binary_mask_3 = (torch.sum(x_output3, dim=1) != 0).type(torch.FloatTensor).unsqueeze(1).cuda()
 
         # semantic loss: depth-wise cross entropy
-        loss1 = F.nll_loss(x_pred1, x_output1, ignore_index=-1)
-
+        if seg_binary_mask is None:
+            loss1 = F.nll_loss(x_pred1, x_output1, ignore_index=-1) 
+        else:
+            loss1 = F.nll_loss(x_pred1, x_output1, ignore_index=-1, reduction='none') 
+            loss1 = loss1 * seg_binary_mask
+            loss1 = loss1.mean()
+            
         # depth loss: l1 norm
         loss2 = torch.sum(torch.abs(x_pred2 - x_output2) * binary_mask) / torch.nonzero(binary_mask).size(0)
 
@@ -229,7 +408,7 @@ class SegNet(nn.Module):
 
 class DecoderWithCrossAttention2(nn.Module):
     def __init__(self, in_channels, aux_dim, output_channels, num_heads=4):
-        super().__init__()
+        super(DecoderWithCrossAttention2, self).__init__()
         # Transposed Convolution for Upsampling
         self.gate = nn.Conv2d(in_channels=in_channels*2, out_channels=1, kernel_size=1)
         self.project_aux = nn.Conv2d(in_channels=aux_dim, out_channels=in_channels, kernel_size=1)
@@ -247,7 +426,6 @@ class DecoderWithCrossAttention2(nn.Module):
         out = self.conv_out(x)
 
         return out
-
 
 class DecoderWithCrossAttention(nn.Module):
     def __init__(self, in_channels, aux_dim, output_channels, num_heads=4):

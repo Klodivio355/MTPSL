@@ -3,13 +3,12 @@
 # set the number of nodes
 #SBATCH --nodes=1
 
-#SBATCH --partition=nmes_gpu
+#SBATCH --partition=shi_gpu
 
 # set name of job
 #SBATCH --job-name=mtl
 
 # set number of GPUs
-#SBATCH --mem-per-gpu=24GB
 #SBATCH --gres=gpu:1
 
 # mail alert at start, end and abortion of execution
@@ -21,4 +20,4 @@
 conda activate /scratch_tmp/grp/grv_shi/k21220263/conda/mtl-partial
 
 # run the application
-python nyu_mtl_xtc.py --out ./results/nyuv6 --ssl-type onelabel --weight 'dwa' --dataroot ./data/nyuv2
+python nyu_mtl_xtc.py --out ./results/nyuv8 --ssl-type onelabel --weight 'dwa' --dataroot ./data/nyuv2

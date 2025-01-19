@@ -62,7 +62,6 @@ class NormalsMeter(object):
 
         return eval_result
 
-
 class DepthMeter(object):
     def __init__(self):
         self.total_rmses = 0.0
