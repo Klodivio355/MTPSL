@@ -17,7 +17,7 @@ import numpy as np
 import pdb
 from progress.bar import Bar as Bar
 from utils import Logger, AverageMeter, accuracy, mkdir_p, savefig
-from utils.misc import confidence_filter, softmax_mse_loss, get_current_consistency_weight, dynamic_thresholding
+from utils.misc import confidence_filter, softmax_mse_loss, get_current_consistency_weight, dynamic_thresholding, dynamic_thresholding2
 from torch.autograd import Variable
 import copy
 
@@ -151,10 +151,6 @@ for epoch in range(start_epoch, total_epoch):
 
     # iteration for all batches
     model.train()
-    for teacher in model.teachers:
-        for param in teacher.parameters():
-            param.detach_()
-
     mapfns.train()
 
     con_loss_ave = AverageMeter()
@@ -164,15 +160,17 @@ for epoch in range(start_epoch, total_epoch):
     cost_consistency = AverageMeter()
     cost_confidence_teacher = AverageMeter()
     cost_confidence_student = AverageMeter()
+    cost_consistency_loss = AverageMeter()
     nyuv2_train_dataset = iter(nyuv2_train_loader)
-    
+    consistency_weight = 0
+
     for k in range(train_batch):
         train_data, train_label, train_depth, train_normal, image_index, train_data1, train_label1, train_depth1, train_normal1, trans_params = next(iter(nyuv2_train_dataset))
         train_data, train_label = train_data.cuda(), train_label.type(torch.LongTensor).cuda()
         train_depth, train_normal = train_depth.cuda(), train_normal.cuda()
         train_data1, train_label1 = train_data1.cuda(), train_label1.type(torch.LongTensor).cuda()
         train_depth1, train_normal1 = train_depth1.cuda(), train_normal1.cuda()
-        train_data_ = torch.cat([train_data, train_data1], dim=0)
+        train_data_ = torch.cat([train_data], dim=0)
 
         # Acquire prediction for all tasks
         train_pred, logsigma, feat, latent_representation = model(train_data_)
@@ -187,17 +185,19 @@ for epoch in range(start_epoch, total_epoch):
         teacher_count = 0
         student_count = 0
         mean = 0
-        sem_pseudo_labels = []
+        new_predictions = []
+        consistency_loss = 0
 
         for ind_ in range(len(image_index)):
-            consistency_loss = 0
-            binary_mask = torch.ones(1, 1, 288, 384).type(torch.FloatTensor).cuda()
+            
+            #binary_mask = torch.ones(1, 1, 288, 384).type(torch.FloatTensor).cuda()
             # Read what tasks what should be supervised
             if opt.ssl_type == 'full':
                 we = torch.ones(len(tasks)).float().cuda()
             else:
                 we = labels_weights[image_index[ind_]].clone().float().cuda()
-
+            #print(we)
+            #print(ind_)
             # Get Prediction for all tasks
             #train_pred_seg = train_pred_aug[0][ind_][None,:,:,:]
             #train_pred_depth = train_pred_aug[1][ind_][None,:,:,:]
@@ -205,16 +205,15 @@ for epoch in range(start_epoch, total_epoch):
             _sc, _h, _w, _i, _j, height, width = trans_params[ind_]
             _h, _w, _i, _j, height, width = int(_h), int(_w), int(_i), int(_j), int(height), int(width)
             
+            #seg_probabilities = F.softmax(train_pred[0][ind_].unsqueeze(0), dim=1)
+            #seg_probs, seg_pred = seg_probabilities.max(1)
+            #seg_confidence_mask = dynamic_thresholding2(seg_probs).type(torch.FloatTensor).cuda()
+            #seg_confidence_mask[train_label[ind_].unsqueeze(0) == -1] = 0
+            #student_value = torch.sum(seg_confidence_mask == 1).item() * 100 / 110592
+            #student_count += student_value
+
             train_target_ind = [train_label[ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0)]
-            train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_label[ind_].unsqueeze(0), train_pred[1][ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_pred[2][ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0), binary_mask)
-            #breakpoint()
-
-            for i in range(len(tasks)):
-                if we[i] == 0:
-                    train_loss_ind[i] = 0
-
-            #print(train_loss_ind)
-            #train_pred_ind = [train_pred_seg, train_pred_depth, train_pred_normal]
+            train_pred_ind = [train_pred[0][ind_].unsqueeze(0), train_pred[1][ind_].unsqueeze(0), train_pred[2][ind_].unsqueeze(0)]
 
             # Get Ground truth 
             gts = torch.cat([train_target_ind[0].unsqueeze(0), train_target_ind[1], train_target_ind[2]], dim=1)
@@ -227,30 +226,27 @@ for epoch in range(start_epoch, total_epoch):
             if we[2] == 0:
                 gts[0][2:5] = 0
 
-            seg_probabilities = F.softmax(torch.exp(train_pred[0][ind_].unsqueeze(0)), dim=1)
-            seg_confidence_mask = dynamic_thresholding(seg_probabilities).type(torch.FloatTensor).cuda()
-            #student_count = torch.sum(seg_confidence_mask == 1)
-            #student_count += torch.mean(seg_confidence_mask, dim=1).item()
-            
+            new_train_pred = model(aux_input = gts, latent=latent_representation[ind_].unsqueeze(0), avail_embed=we.cuda(), pred=train_pred_ind)
+            train_loss_ind = model.model_fit(new_train_pred[0], train_label[ind_].unsqueeze(0), new_train_pred[1], train_depth[ind_].unsqueeze(0), new_train_pred[2], train_normal[ind_].unsqueeze(0))
+            new_predictions.append(new_train_pred)
             #sem_pseudo_labels.append(train_label[ind_].unsqueeze(0))
-            consistency_weight = 1
-            for i, tag in enumerate(copy.deepcopy(we)):
-                if tag == 0 and epoch >= 10: # if task is unsupervised
+            #consistency_weight = 1
+            """ for i, tag in enumerate(copy.deepcopy(we)):
+                if tag == 0: # if task is unsupervised
                     if i == 0:
-                        pseudo_label = model.teacher_forward(latent_representation[ind_].unsqueeze(0), i)
-                        #counter += 1
-                        seg_probabilities = F.softmax(torch.exp(pseudo_label), dim=1)
-                        #binary_mask = dynamic_thresholding(seg_probabilities).type(torch.FloatTensor).cuda()
-                        #teacher_count += torch.sum(binary_mask == 1).item() * 100 / 110592
-                        pseudo_label = seg_probabilities.max(1)[1]
+                        counter += 1
+                        criterion_ema = nn.CrossEntropyLoss(label_smoothing=0.15, ignore_index=-1)
+                        teacher_pred = model.teacher_forward(latent_representation[ind_].unsqueeze(0), i)
+                        teacher_probs, pseudo_label = F.softmax(teacher_pred, dim=1).max(1)
+                        pseudo_label[train_label[ind_].unsqueeze(0) == -1] = -1
                         pseudo_label = pseudo_label.detach().clone().requires_grad_(False)
-                        #sem_pseudo_labels[ind_] = pseudo_label
-                        #consistency_loss += consistency_weight * F.nll_loss(train_pred[0][ind_].unsqueeze(0), pseudo_label.type(dtype=torch.LongTensor).cuda(), ignore_index=-1)
-                        #class_loss += F.nll_loss(train_pred[0][ind_].unsqueeze(0), pseudo_label.type(dtype=torch.LongTensor).cuda())
-                        train_target_ind[0] = pseudo_label
-                        consistency_weight = get_current_consistency_weight(epoch)
+                        consistency_loss = criterion_ema(seg_probs.type(torch.FloatTensor), pseudo_label.type(torch.FloatTensor))
+                        binary_mask = dynamic_thresholding2(teacher_probs).type(torch.FloatTensor).cuda()
+                        binary_mask[train_label[ind_].unsqueeze(0) == -1] = 0
+                        teacher_value = torch.sum(binary_mask == 1).item() * 100 / 110592
+                        teacher_count += teacher_value
+                        consistency_loss *= consistency_weight  """
 
-            #breakpoint()
             # Zero contrastive loss to comply with MTPSL implementation
             con_loss = torch.zeros(1).cuda()
 
@@ -265,52 +261,36 @@ for epoch in range(start_epoch, total_epoch):
 
             con_loss_ave.update(con_loss.item(), 1)
 
-            #breakpoint()
-            # refit with pseudo labels as gt expect for (line below is the final with all pseudo labels for all tasks)
-            #train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_target_ind[0].to(dtype=torch.int64), train_pred[1][ind_].unsqueeze(0), train_target_ind[1], train_pred[2][ind_].unsqueeze(0), train_target_ind[2])
-            train_loss_ind = model.model_fit(train_pred[0][ind_].unsqueeze(0), train_target_ind[0].to(dtype=torch.int64), train_pred[1][ind_].unsqueeze(0), train_depth[ind_].unsqueeze(0), train_pred[2][ind_].unsqueeze(0), train_normal[ind_].unsqueeze(0), binary_mask)
-            
-            # re-zero
-            for i in range(len(tasks)):
-                if we[i] == 0 and i != 0:
-                    train_loss_ind[i] = 0
 
-            #breakpoint()
-            #train_loss_ind[0] = train_loss_ind[0] * consistency_weight
-            #train_loss_ind[0] = train_loss_ind[0] * consistency_weight
+            loss = loss + sum(train_loss_ind[i] for i in range(len(tasks))) / len(image_index) + con_loss * con_weight / len(image_index) #+ (consistency_loss / counter)
 
-            loss = loss + sum(train_loss_ind[i] for i in range(len(tasks))) / len(image_index) + con_loss * con_weight / len(image_index)  
-
-        #breakpoint() #train_label to concatenation of train_target_ind[0]
-        #train_loss = model.model_fit(train_pred[0], train_label, train_pred[1], train_depth, train_pred[2], train_normal)
-
-        #sem_pseudo_labels = [tensor.unsqueeze(0).to(dtype=torch.long) for sublist in sem_pseudo_labels for tensor in sublist]
-        #sem_pseudo_labels = torch.cat(sem_pseudo_labels, dim=0)
-        train_loss = model.model_fit(train_pred[0], train_label, train_pred[1], train_depth, train_pred[2], train_normal)
-        #breakpoint()
+        new_train_pred = [torch.cat((v1, v2), dim=0) for v1, v2 in zip(new_predictions[0], new_predictions[1])]
+        train_loss = model.model_fit(new_train_pred[0], train_label, new_train_pred[1], train_depth, new_train_pred[2], train_normal)
+        student_count = student_count / batch_size
+        teacher_count = teacher_count / counter
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        model.update_ema(global_step)
-        global_step += 1
+
         
         cost_seg.update(train_loss[0].item(), batch_size)
         cost_depth.update(train_loss[1].item(), batch_size)
         cost_normal.update(train_loss[2].item(), batch_size)
         cost_confidence_student.update(student_count, 1)
-        cost_confidence_teacher.update(teacher_count, counter)
+        cost_confidence_teacher.update(teacher_count, 1)
+        cost_consistency_loss.update(consistency_loss, counter)
 
         cost[0] = train_loss[0].item()
-        cost[1] = model.compute_miou(train_pred[0], train_label).item()
-        cost[2] = model.compute_iou(train_pred[0], train_label).item()
+        cost[1] = model.compute_miou(new_train_pred[0], train_label).item()
+        cost[2] = model.compute_iou(new_train_pred[0], train_label).item()
         cost[3] = train_loss[1].item()
-        cost[4], cost[5] = model.depth_error(train_pred[1], train_depth)
+        cost[4], cost[5] = model.depth_error(new_train_pred[1], train_depth)
         cost[6] = train_loss[2].item()
-        cost[7], cost[8], cost[9], cost[10], cost[11] = model.normal_error(train_pred[2], train_normal)
+        cost[7], cost[8], cost[9], cost[10], cost[11] = model.normal_error(new_train_pred[2], train_normal)
         avg_cost[index, :12] += cost[:12] / train_batch
         ctl_cost[index, 0] += con_loss.item() / train_batch
-        bar.suffix  = '({batch}/{size}) | LossS: {loss_s:.4f} | LossD: {loss_d:.4f} | LossN: {loss_n:.4f} | Ws: {ws:.4f} | Wd: {wd:.4f}| Wn: {wn:.4f} | CTL: {ctl:.4f} | CW: {cw:.2f} | SC: {cl:.2f} | TC: {mc:.2f}'.format(
+        bar.suffix  = '({batch}/{size}) | LossS: {loss_s:.4f} | LossD: {loss_d:.4f} | LossN: {loss_n:.4f} | Ws: {ws:.4f} | Wd: {wd:.4f}| Wn: {wn:.4f} | CTL: {ctl:.4f} | CW: {cw:.2f} | SC: {cl:.2f} | TC: {mc:.2f} | UN: {un:.2f}'.format(
                     batch=k + 1,   
                     size=train_batch,
                     # loss_s=cost[1],
@@ -323,9 +303,10 @@ for epoch in range(start_epoch, total_epoch):
                     wd=we[1].data,
                     wn=we[2].data,
                     ctl=con_loss_ave.avg,
-                    cw=con_weight,
+                    cw=consistency_weight,
                     cl= cost_confidence_student.avg,
-                    mc = cost_confidence_teacher.avg
+                    mc = cost_confidence_teacher.avg,
+                    un = cost_consistency_loss.avg
                     )
         bar.next()
     bar.finish()
@@ -336,7 +317,7 @@ for epoch in range(start_epoch, total_epoch):
     elif opt.eval_last20 and (epoch + 1) > (total_epoch - 20):
         evaluate = True 
     else:
-        evaluate = True # False
+        evaluate = False # False
 
     # evaluating test data
     if evaluate:
@@ -353,12 +334,13 @@ for epoch in range(start_epoch, total_epoch):
                 test_depth, test_normal = test_depth.cuda(), test_normal.cuda()
 
                 test_pred, _, _, latent_space = model(test_data)
-                teacher_seg_pred = model.teacher_forward(latent_space, 0)
+                #teacher_seg_pred = model.teacher_forward(latent_space, 0)
+                #teacher_seg_pred = F.log_softmax(teacher_seg_pred, dim=1)
 
                 test_loss = model.model_fit(test_pred[0], test_label, test_pred[1], test_depth, test_pred[2], test_normal)
 
                 conf_mat.update(test_pred[0].argmax(1).flatten(), test_label.flatten())
-                conf_mat_teacher.update(teacher_seg_pred.argmax(1).flatten(), test_label.flatten())
+                #conf_mat_teacher.update(teacher_seg_pred.argmax(1).flatten(), test_label.flatten())
                 depth_mat.update(test_pred[1], test_depth)
                 normal_mat.update(test_pred[2], test_normal)
 
@@ -373,10 +355,8 @@ for epoch in range(start_epoch, total_epoch):
             avg_cost[index, 16], avg_cost[index, 17] = depth_metric['l1'], depth_metric['rmse']
             normal_metric = normal_mat.get_score()
             avg_cost[index, 19], avg_cost[index, 20], avg_cost[index, 21], avg_cost[index, 22], avg_cost[index, 23] = normal_metric['mean'], normal_metric['rmse'], normal_metric['11.25'], normal_metric['22.5'], normal_metric['30']
-            #breakpoint()
-            avg_cost[index, 24:26] = conf_mat_teacher.get_metrics()
+            #avg_cost[index, 24:26] = conf_mat_teacher.get_metrics()
         
-        #breakpoint()
         scheduler.step()
 
         mtl_performance = 0.0

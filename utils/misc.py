@@ -129,7 +129,7 @@ def get_current_consistency_weight(epoch):
     consistency_rampup = 5.0
     return consistency * sigmoid_rampup(epoch, consistency_rampup)
 
-def dynamic_thresholding(logits, q_base=0.5, alpha=0.8, q_min=0.5, q_max=0.99):
+def dynamic_thresholding(logits, q_base=0.9, alpha=0.3, q_min=0.7, q_max=0.95):
     # Hyperparameters
     #q_base = 0.9  # Base quantile
     #alpha = 0.3   # Sensitivity factor
@@ -156,3 +156,6 @@ def dynamic_thresholding(logits, q_base=0.5, alpha=0.8, q_min=0.5, q_max=0.99):
 
     combined_mask = binary_masks.any(dim=1, keepdim=True)  # Shape: [B, 1, H, W]
     return combined_mask
+
+def dynamic_thresholding2(logits, threshold=0.80):
+    return (logits > threshold).type(torch.FloatTensor).cuda()

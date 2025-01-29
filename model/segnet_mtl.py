@@ -126,6 +126,8 @@ class SegNet(nn.Module):
                                     emb_dropout = 0.1,
                                     output_dim=3
                                 )      """                    
+        
+        self.availability_embedding = nn.Linear(3, 64)
 
         self.student_task1 = nn.Sequential(nn.Conv2d(in_channels=filter[0], out_channels=filter[0], kernel_size=3, padding=1),
                                         nn.Conv2d(in_channels=filter[0], out_channels=self.class_nb, kernel_size=1, padding=0))
@@ -150,7 +152,22 @@ class SegNet(nn.Module):
         self.student_task3 = DecoderWithCrossAttention2(512, 5, 3) """
     
 
-        self.teachers = nn.ModuleList([self.teacher_task1, self.teacher_task2, self.teacher_task3])
+        self.linear_layer_sem = nn.Sequential(
+                                            nn.Linear(in_features=1, out_features=64),  # Linear layer
+                                            nn.ReLU()                                    # ReLU activation
+                                        )
+        self.linear_layer_depth = nn.Sequential(
+                                            nn.Linear(in_features=1, out_features=64),  # Linear layer
+                                            nn.ReLU()                                    # ReLU activation
+                                        )
+        self.linear_layer_norm = nn.Sequential(
+                                            nn.Linear(in_features=3, out_features=64),  # Linear layer
+                                            nn.ReLU()                                    # ReLU activation
+                                        )
+        self.linear_layers = nn.ModuleList([self.linear_layer_sem, self.linear_layer_depth, self.linear_layer_norm])
+
+    
+        #self.teachers = nn.ModuleList([self.teacher_task1, self.teacher_task2, self.teacher_task3])
         self.students = nn.ModuleList([self.student_task1, self.student_task2, self.student_task3])
         self.channel_reduction = nn.Conv2d(2208, 512, kernel_size=1, stride=1, bias=False)
 
@@ -167,7 +184,7 @@ class SegNet(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def forward(self, x):
+    def forward(self, x=None, aux_input=None, latent=None, avail_embed=None, pred=None):
 
         #feature_maps = self.backbone(x, output_hidden_states=True).reshaped_hidden_states
         """ feature_maps = self.backbone(x, output_hidden_states=True).hidden_states
@@ -180,42 +197,89 @@ class SegNet(nn.Module):
         feat = feature_maps[-1]
         latent_representation = self.channel_reduction(torch.cat(interpolated_features, dim=1))   """
 
-        g_encoder, g_decoder, g_maxpool, g_upsampl, indices = ([0] * 5 for _ in range(5))
-        for i in range(5):
-            g_encoder[i], g_decoder[-i - 1] = ([0] * 2 for _ in range(2))
 
-        # global shared encoder-decoder network
-        for i in range(5):
-            if i == 0:
-                g_encoder[i][0] = self.encoder_block[i](x)
-                g_encoder[i][1] = self.conv_block_enc[i](g_encoder[i][0])
-                g_maxpool[i], indices[i] = self.down_sampling(g_encoder[i][1])
-            else:
-                g_encoder[i][0] = self.encoder_block[i](g_maxpool[i - 1])
-                g_encoder[i][1] = self.conv_block_enc[i](g_encoder[i][0])
-                g_maxpool[i], indices[i] = self.down_sampling(g_encoder[i][1])
-        feat = [g_maxpool[i]]
-        # feat = [g_maxpool]
-        for i in range(5):
-            if i == 0:
-                g_upsampl[i] = self.up_sampling(g_maxpool[-1], indices[-i - 1])
-                g_decoder[i][0] = self.decoder_block[-i - 1](g_upsampl[i])
-                g_decoder[i][1] = self.conv_block_dec[-i - 1](g_decoder[i][0])
-            else:
-                g_upsampl[i] = self.up_sampling(g_decoder[i - 1][-1], indices[-i - 1])
-                g_decoder[i][0] = self.decoder_block[-i - 1](g_upsampl[i])
-                g_decoder[i][1] = self.conv_block_dec[-i - 1](g_decoder[i][0])
+        if x is not None:
+            g_encoder, g_decoder, g_maxpool, g_upsampl, indices = ([0] * 5 for _ in range(5))
+            for i in range(5):
+                g_encoder[i], g_decoder[-i - 1] = ([0] * 2 for _ in range(2))
 
-        feat.append(g_decoder[i][1])
-        latent_representation = g_decoder[i][1]
+            # global shared encoder-decoder network
+            for i in range(5):
+                if i == 0:
+                    g_encoder[i][0] = self.encoder_block[i](x)
+                    g_encoder[i][1] = self.conv_block_enc[i](g_encoder[i][0])
+                    g_maxpool[i], indices[i] = self.down_sampling(g_encoder[i][1])
+                else:
+                    g_encoder[i][0] = self.encoder_block[i](g_maxpool[i - 1])
+                    g_encoder[i][1] = self.conv_block_enc[i](g_encoder[i][0])
+                    g_maxpool[i], indices[i] = self.down_sampling(g_encoder[i][1])
+            feat = [g_maxpool[i]]
+            # feat = [g_maxpool]
+            for i in range(5):
+                if i == 0:
+                    g_upsampl[i] = self.up_sampling(g_maxpool[-1], indices[-i - 1])
+                    g_decoder[i][0] = self.decoder_block[-i - 1](g_upsampl[i])
+                    g_decoder[i][1] = self.conv_block_dec[-i - 1](g_decoder[i][0])
+                else:
+                    g_upsampl[i] = self.up_sampling(g_decoder[i - 1][-1], indices[-i - 1])
+                    g_decoder[i][0] = self.decoder_block[-i - 1](g_upsampl[i])
+                    g_decoder[i][1] = self.conv_block_dec[-i - 1](g_decoder[i][0])
 
-        # define task prediction layers
-        t1_pred = F.log_softmax(self.student_task1(latent_representation), dim=1)
-        t2_pred = self.student_task2(latent_representation)
-        t3_pred = self.student_task3(latent_representation)
-        t3_pred = t3_pred / torch.norm(t3_pred, p=2, dim=1, keepdim=True)
+            feat.append(g_decoder[i][1])
+            latent_representation = g_decoder[i][1]
+            """ binary_vectors = [torch.tensor([1, 1, 1])]
 
-        return [t1_pred, t2_pred, t3_pred], self.logsigma, feat, latent_representation
+             # Get indices where Z == 1
+            indices_list = [torch.nonzero(vec, as_tuple=True)[0] for vec in binary_vectors]
+            max_length = 3
+            padded_indices = torch.stack([
+                torch.cat([idx, -1 * torch.ones(max_length - len(idx), dtype=torch.long)]) if len(idx) < max_length else idx[:max_length]
+                for idx in indices_list
+            ])
+            Z_embed = self.availability_embedding(padded_indices.cuda()).sum(dim=1)   # Sum embeddings of available tasks
+            breakpoint()
+            Z_embed = Z_embed.view(1, 64, 1, 1)  
+            Z_embed = Z_embed.expand_as(latent_representation)
+            latent_representation = latent_representation + Z_embed """
+            t1_pred = F.log_softmax(self.student_task1(latent_representation), dim=1)
+            t2_pred = self.student_task2(latent_representation)
+            t3_pred = self.student_task3(latent_representation)
+            t3_pred = t3_pred / torch.norm(t3_pred, p=2, dim=1, keepdim=True)
+            return [t1_pred, t2_pred, t3_pred], self.logsigma, feat, latent_representation
+        else:
+            Z_embed = self.availability_embedding(avail_embed)
+            Z_embed = Z_embed.view(1, 64, 1, 1)
+            Z_embed = Z_embed.expand_as(latent)
+            latent_representation = latent + Z_embed
+            new_pred = pred 
+
+            for i, tag in enumerate(avail_embed):
+                if tag == 0 and i == 0:
+                    task_information = aux_input[0][0].unsqueeze(0)
+                    reshaped_aux = task_information.permute(1, 2, 0)
+                    auxiliary_task_inf = self.linear_layers[i](reshaped_aux)
+                    final_aux = auxiliary_task_inf.permute(2, 0, 1)
+                    final_aux = final_aux.expand_as(latent)
+                    latent_representation = latent_representation + final_aux
+                    new_pred[0] = F.log_softmax(self.student_task1(latent_representation), dim=1)
+                elif tag == 0 and i == 1:
+                    task_information = aux_input[0][1].unsqueeze(0)
+                    reshaped_aux = task_information.permute(1, 2, 0)
+                    auxiliary_task_inf = self.linear_layers[i](reshaped_aux)
+                    final_aux = auxiliary_task_inf.permute(2, 0, 1)
+                    final_aux = final_aux.expand_as(latent)
+                    latent_representation = latent_representation + final_aux
+                    new_pred[1] = self.student_task2(latent_representation)
+                elif tag == 0 and i == 2:
+                    task_information = aux_input[0][2:5]
+                    reshaped_aux = task_information.permute(1, 2, 0)
+                    auxiliary_task_inf = self.linear_layers[i](reshaped_aux)
+                    final_aux = auxiliary_task_inf.permute(2, 0, 1)
+                    final_aux = final_aux.expand_as(latent)
+                    latent_representation = latent_representation + final_aux
+                    pred_surface = self.student_task3(latent_representation)
+                    new_pred[2] = pred_surface / torch.norm(pred_surface, p=2, dim=1, keepdim=True)
+            return new_pred
 
     def conv_layer(self, channel):
         if self.type == 'deep':
@@ -261,7 +325,7 @@ class SegNet(nn.Module):
         if index == 0:
             #prediction = torch.argmax(F.log_softmax(self.teachers[index](x), dim=1), dim=1)
              #prediction = F.softmax(self.teachers[index](x), dim=1).max(1)
-             prediction = F.log_softmax(self.teachers[index](x), dim=1)
+             prediction = self.teachers[index](x)
         elif index == 1:
             prediction = self.teachers[index](x)
         elif index == 2:
@@ -277,13 +341,9 @@ class SegNet(nn.Module):
         binary_mask_3 = (torch.sum(x_output3, dim=1) != 0).type(torch.FloatTensor).unsqueeze(1).cuda()
 
         # semantic loss: depth-wise cross entropy
-        if seg_binary_mask is None:
-            loss1 = F.nll_loss(x_pred1, x_output1, ignore_index=-1) 
-        else:
-            loss1 = F.nll_loss(x_pred1, x_output1, ignore_index=-1, reduction='none') 
-            loss1 = loss1 * seg_binary_mask
-            loss1 = loss1.mean()
-            
+        #breakpoint()
+        loss1 = F.nll_loss(x_pred1, x_output1, ignore_index=-1) 
+
         # depth loss: l1 norm
         loss2 = torch.sum(torch.abs(x_pred2 - x_output2) * binary_mask) / torch.nonzero(binary_mask).size(0)
 
